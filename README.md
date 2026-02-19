@@ -200,6 +200,15 @@ make test
 Tests are in `tests/` and use [pytest](https://pytest.org).
 Coverage reports are generated at `coverage.xml` and printed to the terminal.
 
+#### End-to-end tests
+
+The e2e tests hit a real vLLM server and are **skipped by default**.
+To run them, set the server URL and use the `e2e` marker:
+
+```bash
+GLMOCR_REMOTE_OCR_API_URL=http://localhost:8001/v1/chat/completions pytest -m e2e
+```
+
 ### Code quality
 
 This project uses:
@@ -227,4 +236,4 @@ The workflow tags the commit, builds the package, and publishes to PyPI via trus
 
 ## License
 
-[MIT](LICENSE) © Yanick Schraner
+[MIT](LICENSE) © Data Competence Center Basel-Stadt
