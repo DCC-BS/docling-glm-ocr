@@ -1,0 +1,156 @@
+[project]
+name = "docling-glm-ocr"
+version = "0.1.0"
+description = "A docling OCR plugin for GLM-OCR"
+authors = [
+    {name = "Yanick Schraner", email = "yanick.schraner@bs.ch"}
+]
+requires-python = ">=3.13"
+license = {text = "MIT"}
+readme = "README.md"
+keywords = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    
+    "License :: OSI Approved :: MIT License",
+    
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Typing :: Typed",
+]
+dependencies = [
+    "docling>=2.73",
+    "httpx>=0.27",
+    "pillow>=10.0",
+]
+
+[project.entry-points."docling"]
+docling_glm_ocr = "docling_glm_ocr.plugin"
+
+[project.urls]
+Homepage = "https://github.com/DCC-BS/docling-glm-ocr"
+Repository = "https://github.com/DCC-BS/docling-glm-ocr"
+Issues = "https://github.com/DCC-BS/docling-glm-ocr/issues"
+Changelog = "https://github.com/DCC-BS/docling-glm-ocr/releases"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.9.0",
+    "ty>=0.0.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/docling_glm_ocr"]
+
+# ---------------------------------------------------------------------------
+# Ruff – linter + formatter
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "A",    # flake8-builtins
+    "ANN",  # flake8-annotations
+    "ARG",  # flake8-unused-arguments
+    "B",    # flake8-bugbear
+    "BLE",  # flake8-blind-except
+    "C4",   # flake8-comprehensions
+    "C90",  # mccabe complexity
+    "COM",  # flake8-commas
+    "D",    # pydocstyle
+    "DTZ",  # flake8-datetimez
+    "E",    # pycodestyle errors
+    "EM",   # flake8-errmsg
+    "ERA",  # eradicate
+    "F",    # pyflakes
+    "FBT",  # flake8-boolean-trap
+    "I",    # isort
+    "ICN",  # flake8-import-conventions
+    "ISC",  # flake8-implicit-str-concat
+    "N",    # pep8-naming
+    "PD",   # pandas-vet
+    "PGH",  # pygrep-hooks
+    "PIE",  # flake8-pie
+    "PL",   # pylint
+    "PT",   # flake8-pytest-style
+    "PTH",  # flake8-use-pathlib
+    "PYI",  # flake8-pyi
+    "Q",    # flake8-quotes
+    "RET",  # flake8-return
+    "RSE",  # flake8-raise
+    "RUF",  # ruff-specific
+    "S",    # flake8-bandit
+    "SIM",  # flake8-simplify
+    "SLF",  # flake8-self
+    "T20",  # flake8-print
+    "TCH",  # flake8-type-checking
+    "TID",  # flake8-tidy-imports
+    "TRY",  # tryceratops
+    "UP",   # pyupgrade
+    "W",    # pycodestyle warnings
+    "YTT",  # flake8-2020
+]
+ignore = [
+    "COM812",  # trailing comma – conflicts with formatter
+    "D100",    # missing docstring in public module
+    "D104",    # missing docstring in public package
+    "D107",    # missing docstring in __init__
+    "D203",    # one-blank-line-before-class (conflicts with D211)
+    "D213",    # multi-line-summary-second-line (conflicts with D212)
+    "ISC001",  # implicit string concat – conflicts with formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "D", "ANN", "ARG"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+preview = true
+indent-style = "space"
+quote-style = "double"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# ---------------------------------------------------------------------------
+# ty – type checker
+# ---------------------------------------------------------------------------
+[tool.ty.environment]
+python-version = "3.13"
+
+# ---------------------------------------------------------------------------
+# pytest + coverage
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "--cov=src/docling_glm_ocr",
+    "--cov-report=term-missing",
+    "--cov-report=xml",
+    "-v",
+]
+
+[tool.coverage.run]
+source = ["src/docling_glm_ocr"]
+branch = true
+omit = ["tests/*", ".venv/*"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+]

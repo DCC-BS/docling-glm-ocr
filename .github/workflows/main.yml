@@ -1,0 +1,59 @@
+name: Main
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Quality checks via DCC-BS reusable workflow (ruff lint + format + ty)
+  # ---------------------------------------------------------------------------
+  quality:
+    uses: DCC-BS/ci-workflows/.github/workflows/python-backend-ci.yml@v8
+    with:
+      python_versions: '["3.13"]'
+      quality_python_version: "3.13"
+      check_command: "make check"
+
+  # ---------------------------------------------------------------------------
+  # Tests + coverage
+  # ---------------------------------------------------------------------------
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: [quality]
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Run tests with coverage
+        run: uv run pytest --cov --cov-report=xml
+        
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          fail_ci_if_error: false
+        
