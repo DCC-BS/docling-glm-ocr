@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from unittest.mock import patch
 
 import pytest
@@ -9,12 +10,22 @@ import pytest
 from docling_glm_ocr.options import GlmOcrRemoteOptions
 
 
-@pytest.fixture()
+def pytest_collection_modifyitems(config, items):
+    """Auto-skip e2e tests when no vLLM server URL is configured."""
+    if os.environ.get("GLMOCR_REMOTE_OCR_API_URL"):
+        return
+    skip_e2e = pytest.mark.skip(reason="GLMOCR_REMOTE_OCR_API_URL not set")
+    for item in items:
+        if "e2e" in item.keywords:
+            item.add_marker(skip_e2e)
+
+
+@pytest.fixture
 def default_options() -> GlmOcrRemoteOptions:
     return GlmOcrRemoteOptions()
 
 
-@pytest.fixture()
+@pytest.fixture
 def mock_model():
     """Create a GlmOcrRemoteModel with a mocked HTTP client."""
     from docling.datamodel.accelerator_options import AcceleratorOptions

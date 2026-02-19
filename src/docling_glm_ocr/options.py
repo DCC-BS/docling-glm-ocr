@@ -6,7 +6,7 @@ import os
 from typing import ClassVar, Literal
 
 from docling.datamodel.pipeline_options import OcrOptions
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 
 
 class GlmOcrRemoteOptions(OcrOptions):
@@ -28,7 +28,7 @@ class GlmOcrRemoteOptions(OcrOptions):
 
     kind: ClassVar[Literal["glm-ocr-remote"]] = "glm-ocr-remote"
 
-    lang: list[str] = ["en"]
+    lang: list[str] = Field(default_factory=lambda: ["en"])
     api_url: str = os.environ.get(
         "GLMOCR_REMOTE_OCR_API_URL",
         "http://localhost:8001/v1/chat/completions",

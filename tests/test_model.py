@@ -46,13 +46,11 @@ class TestRecogniseCrop:
         model, mock_client = mock_model
 
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "choices": [{"message": {"content": "Hello World"}}]
-        }
+        mock_response.json.return_value = {"choices": [{"message": {"content": "Hello World"}}]}
         mock_client.post.return_value = mock_response
 
         img = Image.new("RGB", (50, 50))
-        result = model._recognise_crop(img)
+        model._recognise_crop(img)
 
         mock_client.post.assert_called_once()
         call_args = mock_client.post.call_args
@@ -74,9 +72,7 @@ class TestRecogniseCrop:
         model, mock_client = mock_model
 
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "choices": [{"message": {"content": "Extracted text content"}}]
-        }
+        mock_response.json.return_value = {"choices": [{"message": {"content": "Extracted text content"}}]}
         mock_client.post.return_value = mock_response
 
         img = Image.new("RGB", (50, 50))
@@ -167,3 +163,229 @@ class TestModelInit:
         model, _ = mock_model
         assert isinstance(model.options, GlmOcrRemoteOptions)
         assert model.options.model_name == "test-model"
+
+
+class TestCall:
+    """Tests for GlmOcrRemoteModel.__call__."""
+
+    @staticmethod
+    def _make_ocr_rect(*, left=0, top=0, right=50, bottom=50, area=2500):
+        rect = MagicMock()
+        rect.area.return_value = area
+        rect.l, rect.t, rect.r, rect.b = left, top, right, bottom
+        return rect
+
+    def test_valid_page_produces_text_cells(self, mock_model):
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        page._backend.get_page_image.return_value = Image.new("RGB", (100, 100))
+
+        ocr_rect = self._make_ocr_rect()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "Hello World"}}]}
+        mock_client.post.return_value = mock_resp
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[ocr_rect]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            pages = list(model(MagicMock(), [page]))
+
+        assert len(pages) == 1
+        mock_post.assert_called_once()
+        cells = mock_post.call_args[0][0]
+        assert len(cells) == 1
+        assert cells[0].text == "Hello World"
+        assert cells[0].from_ocr is True
+        assert cells[0].confidence == 1.0
+
+    def test_cell_index_matches_enumerate_position(self, mock_model):
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        page._backend.get_page_image.return_value = Image.new("RGB", (100, 100))
+
+        skip_rect = self._make_ocr_rect(area=0)
+        real_rect = self._make_ocr_rect(left=50, right=100)
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "Text"}}]}
+        mock_client.post.return_value = mock_resp
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[skip_rect, real_rect]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            list(model(MagicMock(), [page]))
+
+        cells = mock_post.call_args[0][0]
+        assert len(cells) == 1
+        assert cells[0].index == 1
+
+    def test_invalid_backend_yields_page_unchanged(self, mock_model):
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = False
+
+        pages = list(model(MagicMock(), [page]))
+
+        assert pages == [page]
+        mock_client.post.assert_not_called()
+
+    def test_zero_area_rect_skipped(self, mock_model):
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+
+        ocr_rect = self._make_ocr_rect(area=0)
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[ocr_rect]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            pages = list(model(MagicMock(), [page]))
+
+        assert len(pages) == 1
+        cells = mock_post.call_args[0][0]
+        assert len(cells) == 0
+        mock_client.post.assert_not_called()
+
+    def test_blank_text_skipped(self, mock_model):
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        page._backend.get_page_image.return_value = Image.new("RGB", (100, 100))
+
+        ocr_rect = self._make_ocr_rect()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "   \n  "}}]}
+        mock_client.post.return_value = mock_resp
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[ocr_rect]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            list(model(MagicMock(), [page]))
+
+        cells = mock_post.call_args[0][0]
+        assert len(cells) == 0
+
+    def test_http_error_logged_and_continued(self, mock_model):
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        page._backend.get_page_image.return_value = Image.new("RGB", (100, 100))
+
+        bad_rect = self._make_ocr_rect(left=0, top=0, right=50, bottom=50)
+        good_rect = self._make_ocr_rect(left=50, top=0, right=100, bottom=50)
+
+        error_resp = MagicMock()
+        error_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "Server Error",
+            request=MagicMock(),
+            response=MagicMock(status_code=500),
+        )
+        ok_resp = MagicMock()
+        ok_resp.json.return_value = {"choices": [{"message": {"content": "Good"}}]}
+        mock_client.post.side_effect = [error_resp, ok_resp]
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[bad_rect, good_rect]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            pages = list(model(MagicMock(), [page]))
+
+        assert len(pages) == 1
+        cells = mock_post.call_args[0][0]
+        assert len(cells) == 1
+        assert cells[0].text == "Good"
+
+    def test_multiple_rects_produce_multiple_cells(self, mock_model):
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        page._backend.get_page_image.return_value = Image.new("RGB", (100, 100))
+
+        rect1 = self._make_ocr_rect(left=0, top=0, right=50, bottom=50)
+        rect2 = self._make_ocr_rect(left=50, top=0, right=100, bottom=50)
+        resp1 = MagicMock()
+        resp1.json.return_value = {"choices": [{"message": {"content": "Cell one"}}]}
+        resp2 = MagicMock()
+        resp2.json.return_value = {"choices": [{"message": {"content": "Cell two"}}]}
+        mock_client.post.side_effect = [resp1, resp2]
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[rect1, rect2]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            list(model(MagicMock(), [page]))
+
+        cells = mock_post.call_args[0][0]
+        assert len(cells) == 2
+        assert cells[0].text == "Cell one"
+        assert cells[1].text == "Cell two"
+
+    def test_no_ocr_rects_yields_page(self, mock_model):
+        model, _ = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            pages = list(model(MagicMock(), [page]))
+
+        assert len(pages) == 1
+        cells = mock_post.call_args[0][0]
+        assert len(cells) == 0
+
+    def test_multiple_pages_all_yielded(self, mock_model):
+        model, mock_client = mock_model
+        pages_in = []
+        for _ in range(3):
+            p = MagicMock()
+            p._backend.is_valid.return_value = True
+            p._backend.get_page_image.return_value = Image.new("RGB", (100, 100))
+            pages_in.append(p)
+
+        rect = self._make_ocr_rect()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "T"}}]}
+        mock_client.post.return_value = mock_resp
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[rect]),
+            patch.object(model, "post_process_cells"),
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            pages_out = list(model(MagicMock(), pages_in))
+
+        assert len(pages_out) == 3
+
+    def test_get_page_image_called_with_correct_scale(self, mock_model):
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        page._backend.get_page_image.return_value = Image.new("RGB", (100, 100))
+
+        ocr_rect = self._make_ocr_rect()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "X"}}]}
+        mock_client.post.return_value = mock_resp
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[ocr_rect]),
+            patch.object(model, "post_process_cells"),
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            list(model(MagicMock(), [page]))
+
+        page._backend.get_page_image.assert_called_once_with(scale=3, cropbox=ocr_rect)

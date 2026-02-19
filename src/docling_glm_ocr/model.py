@@ -10,22 +10,25 @@ from __future__ import annotations
 import base64
 import io
 import logging
-from collections.abc import Iterable
-from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import httpx
-from docling.datamodel.accelerator_options import AcceleratorOptions
-from docling.datamodel.base_models import Page
-from docling.datamodel.document import ConversionResult
-from docling.datamodel.pipeline_options import OcrOptions
 from docling.models.base_ocr_model import BaseOcrModel
 from docling.utils.profiling import TimeRecorder
 from docling_core.types.doc import BoundingBox, CoordOrigin
 from docling_core.types.doc.page import BoundingRectangle, TextCell
-from PIL import Image
 
 from docling_glm_ocr.options import GlmOcrRemoteOptions
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
+
+    from docling.datamodel.accelerator_options import AcceleratorOptions
+    from docling.datamodel.base_models import Page
+    from docling.datamodel.document import ConversionResult
+    from docling.datamodel.pipeline_options import OcrOptions
+    from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +47,7 @@ class GlmOcrRemoteModel(BaseOcrModel):
         self,
         *,
         enabled: bool,
-        artifacts_path: Optional[Path],
+        artifacts_path: Path | None,
         options: GlmOcrRemoteOptions,
         accelerator_options: AcceleratorOptions,
     ) -> None:
@@ -93,13 +96,13 @@ class GlmOcrRemoteModel(BaseOcrModel):
         conv_res: ConversionResult,
         page_batch: Iterable[Page],
     ) -> Iterable[Page]:
+        """Run OCR on each page crop and yield pages with recognised text cells."""
         if not self.enabled:
             yield from page_batch
             return
 
         for page in page_batch:
-            assert page._backend is not None
-            if not page._backend.is_valid():
+            if page._backend is None or not page._backend.is_valid():  # noqa: SLF001
                 yield page
                 continue
 
@@ -111,7 +114,7 @@ class GlmOcrRemoteModel(BaseOcrModel):
                     if ocr_rect.area() == 0:
                         continue
 
-                    high_res_image = page._backend.get_page_image(
+                    high_res_image = page._backend.get_page_image(  # noqa: SLF001
                         scale=self.scale,
                         cropbox=ocr_rect,
                     )
@@ -152,4 +155,5 @@ class GlmOcrRemoteModel(BaseOcrModel):
 
     @classmethod
     def get_options_type(cls) -> type[OcrOptions]:
+        """Return the options class for this OCR engine."""
         return GlmOcrRemoteOptions
