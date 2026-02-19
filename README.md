@@ -15,11 +15,10 @@ A docling OCR plugin that delegates text recognition to a remote
 
 [![PyPI version](https://img.shields.io/pypi/v/docling-glm-ocr.svg)](https://pypi.org/project/docling-glm-ocr/)
 [![Python versions](https://img.shields.io/pypi/pyversions/docling-glm-ocr.svg)](https://pypi.org/project/docling-glm-ocr/)
-[![License](https://img.shields.io/github/license/DCC-BS/docling-glm-ocr)](https://github.com/DCC-BS/docling-glm-ocr/blob/main/LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/DCC-BS/docling-glm-ocr/blob/main/LICENSE)
 [![CI](https://github.com/DCC-BS/docling-glm-ocr/actions/workflows/main.yml/badge.svg)](https://github.com/DCC-BS/docling-glm-ocr/actions/workflows/main.yml)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
-[![Coverage](https://codecov.io/gh/DCC-BS/docling-glm-ocr/graph/badge.svg)](https://codecov.io/gh/DCC-BS/docling-glm-ocr)
-
+[![codecov](https://codecov.io/gh/DCC-BS/docling-glm-ocr/graph/badge.svg?token=LOPIP1UZOC)](https://codecov.io/gh/DCC-BS/docling-glm-ocr)
 
 ## Overview
 
