@@ -1,12 +1,12 @@
 [project]
 name = "docling-glm-ocr"
-version = "0.2.0"
+version = "0.3.0"
 description = "A docling OCR plugin for GLM-OCR"
 authors = [
     {name = "Yanick Schraner", email = "yanick.schraner@bs.ch"},
     {name = "Tobias Bollinger", email = "tobias.bollinger@bs.ch"},
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 license = {text = "MIT"}
 readme = "README.md"
 keywords = []
