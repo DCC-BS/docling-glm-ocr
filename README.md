@@ -116,6 +116,10 @@ All options can be set programmatically via `GlmOcrRemoteOptions`:
 | `prompt` | `str` | Text prompt for each image crop | `GLMOCR_REMOTE_OCR_PROMPT` env or default prompt |
 | `timeout` | `float` | HTTP timeout per crop (seconds) | `120` |
 | `max_tokens` | `int` | Max tokens per completion | `16384` |
+| `scale` | `float` | Image crop rendering scale | `3.0` |
+| `max_concurrent_requests` | `int` | Max concurrent API requests | `10` |
+| `max_retries` | `int` | Max retry attempts for HTTP errors | `3` |
+| `retry_backoff_factor` | `float` | Exponential backoff factor for retries | `2.0` |
 | `lang` | `list[str]` | Language hint (passed to docling) | `["en"]` |
 
 Default prompt:
@@ -144,9 +148,9 @@ flowchart LR
 
 For each page the model:
 1. Collects OCR regions from the docling layout analysis
-2. Renders each region at 3× scale (216 dpi) using the page backend
+2. Renders each region using the page backend (scale configurable, default 3×)
 3. Encodes the crop as a base64 PNG data URI
-4. POSTs a chat completion request to the vLLM endpoint
+4. POSTs concurrent chat completion requests to the vLLM endpoint (with retry logic)
 5. Returns the recognised text as `TextCell` objects for docling to merge
 
 ## Starting a GLM-OCR vLLM server

@@ -8,8 +8,10 @@ standard-pipeline output.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import io
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import httpx
@@ -58,10 +60,14 @@ class GlmOcrRemoteModel(BaseOcrModel):
             accelerator_options=accelerator_options,
         )
         self.options: GlmOcrRemoteOptions
-        self.scale = 3  # 72 dpi → 216 dpi
+        self.scale = self.options.scale
 
         if self.enabled:
-            self._client = httpx.Client(timeout=self.options.timeout)
+            limits = httpx.Limits(
+                max_connections=self.options.max_concurrent_requests,
+                max_keepalive_connections=self.options.max_concurrent_requests,
+            )
+            self._client = httpx.Client(timeout=self.options.timeout, limits=limits)
             logger.info(
                 "GlmOcrRemoteModel initialised: api_url=%s  model=%s",
                 self.options.api_url,
@@ -91,6 +97,65 @@ class GlmOcrRemoteModel(BaseOcrModel):
             return ""
         return choices[0].get("message", {}).get("content", "")
 
+    def _recognise_crop_with_retry(self, image: Image.Image) -> str:
+        """Send a single cropped image with retry logic."""
+        max_retries = self.options.max_retries
+        backoff = self.options.retry_backoff_factor
+
+        for attempt in range(max_retries + 1):
+            try:
+                return self._recognise_crop(image)
+            except httpx.HTTPError:
+                if attempt == max_retries:
+                    logger.exception("GLM-OCR remote call failed after %d retries", max_retries)
+                    raise
+
+                sleep_time = backoff**attempt
+                logger.warning(
+                    "GLM-OCR remote call failed (attempt %d/%d). Retrying in %.1f seconds...",
+                    attempt + 1,
+                    max_retries,
+                    sleep_time,
+                )
+                time.sleep(sleep_time)
+        return ""
+
+    def _process_crop(
+        self,
+        cell_idx: int,
+        ocr_rect: BoundingBox,
+        image: Image.Image | None,
+    ) -> TextCell | None:
+        if image is None:
+            return None
+
+        try:
+            text = self._recognise_crop_with_retry(image)
+        except httpx.HTTPError:
+            return None
+
+        if not text.strip():
+            return None
+
+        return TextCell(
+            index=cell_idx,
+            text=text,
+            orig=text,
+            from_ocr=True,
+            confidence=1.0,
+            rect=BoundingRectangle.from_bounding_box(
+                BoundingBox.from_tuple(
+                    coord=(
+                        ocr_rect.l,
+                        ocr_rect.t,
+                        ocr_rect.r,
+                        ocr_rect.b,
+                    ),
+                    origin=CoordOrigin.TOPLEFT,
+                )
+            ),
+        )
+
     def __call__(
         self,
         conv_res: ConversionResult,
@@ -110,44 +175,33 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 ocr_rects = self.get_ocr_rects(page)
                 all_ocr_cells: list[TextCell] = []
 
+                # Extract all images sequentially to avoid thread-safety issues with the PDF backend
+                crop_data = []
                 for cell_idx, ocr_rect in enumerate(ocr_rects):
                     if ocr_rect.area() == 0:
-                        continue
-
-                    high_res_image = page._backend.get_page_image(  # noqa: SLF001
-                        scale=self.scale,
-                        cropbox=ocr_rect,
-                    )
-
-                    try:
-                        text = self._recognise_crop(high_res_image)
-                    except httpx.HTTPError:
-                        logger.exception("GLM-OCR remote call failed for crop %d", cell_idx)
-                        continue
-
-                    if not text.strip():
-                        continue
-
-                    all_ocr_cells.append(
-                        TextCell(
-                            index=cell_idx,
-                            text=text,
-                            orig=text,
-                            from_ocr=True,
-                            confidence=1.0,
-                            rect=BoundingRectangle.from_bounding_box(
-                                BoundingBox.from_tuple(
-                                    coord=(
-                                        ocr_rect.l,
-                                        ocr_rect.t,
-                                        ocr_rect.r,
-                                        ocr_rect.b,
-                                    ),
-                                    origin=CoordOrigin.TOPLEFT,
-                                )
-                            ),
+                        crop_data.append((cell_idx, ocr_rect, None))
+                    else:
+                        high_res_image = page._backend.get_page_image(  # noqa: SLF001
+                            scale=self.scale,
+                            cropbox=ocr_rect,
                         )
-                    )
+                        crop_data.append((cell_idx, ocr_rect, high_res_image))
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.options.max_concurrent_requests
+                ) as executor:
+                    futures = [
+                        executor.submit(self._process_crop, cell_idx, ocr_rect, image)
+                        for cell_idx, ocr_rect, image in crop_data
+                    ]
+
+                    for future in concurrent.futures.as_completed(futures):
+                        cell = future.result()
+                        if cell is not None:
+                            all_ocr_cells.append(cell)
+
+                # Sort by index to maintain deterministic sequential order
+                all_ocr_cells.sort(key=lambda c: c.index)
 
                 self.post_process_cells(all_ocr_cells, page)
 

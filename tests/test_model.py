@@ -276,6 +276,10 @@ class TestCall:
 
     def test_http_error_logged_and_continued(self, mock_model):
         model, mock_client = mock_model
+        model.options.max_retries = 1
+        model.options.retry_backoff_factor = 0.0
+        model.options.max_concurrent_requests = 1
+
         page = MagicMock()
         page._backend.is_valid.return_value = True
         page._backend.get_page_image.return_value = Image.new("RGB", (100, 100))
@@ -291,7 +295,7 @@ class TestCall:
         )
         ok_resp = MagicMock()
         ok_resp.json.return_value = {"choices": [{"message": {"content": "Good"}}]}
-        mock_client.post.side_effect = [error_resp, ok_resp]
+        mock_client.post.side_effect = [error_resp, error_resp, ok_resp]
 
         with (
             patch.object(model, "get_ocr_rects", return_value=[bad_rect, good_rect]),
@@ -307,6 +311,8 @@ class TestCall:
 
     def test_multiple_rects_produce_multiple_cells(self, mock_model):
         model, mock_client = mock_model
+        model.options.max_concurrent_requests = 1
+
         page = MagicMock()
         page._backend.is_valid.return_value = True
         page._backend.get_page_image.return_value = Image.new("RGB", (100, 100))

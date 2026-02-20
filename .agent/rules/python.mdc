@@ -1,0 +1,17 @@
+---
+description: Python
+globs: **/*.py
+alwaysApply: false
+---
+
+You have access to context7 to fetch up to date documentation on libraries and frameworks.
+
+
+Execute python code, tests, ruff or linter:
+- Always use uv or make to execute commands.
+- To run python files: `uv run script.py`
+- To run tests: `make test`
+- To run pre-commit: `make check`
+
+Development Guidelines:
+Check the development guidelines here: https://dcc-bs.github.io/documentation/coding/python.html
