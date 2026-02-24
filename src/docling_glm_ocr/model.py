@@ -98,7 +98,7 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 max_keepalive_connections=self.options.max_concurrent_requests,
             )
             self._local.client = httpx.Client(timeout=self.options.timeout, limits=limits)
-        return self._local.client  # type: ignore[return-value]
+        return self._local.client
 
     def _recognise_crop(self, image: Image.Image) -> str:
         """Send a single cropped image to the remote GLM-OCR endpoint."""
@@ -230,6 +230,9 @@ class GlmOcrRemoteModel(BaseOcrModel):
         exceeds ``max_image_pixels``, keeping the vLLM encoder token count
         within its pre-allocated cache.
         """
+        backend = page._backend  # noqa: SLF001
+        if backend is None:
+            return []
         crop_data: list[tuple[int, BoundingBox, Image.Image | None]] = []
         for cell_idx, ocr_rect in enumerate(ocr_rects):
             if ocr_rect.area() == 0:
@@ -253,7 +256,7 @@ class GlmOcrRemoteModel(BaseOcrModel):
                     self.options.scale,
                     actual_scale,
                 )
-            high_res_image = page._backend.get_page_image(  # noqa: SLF001
+            high_res_image = backend.get_page_image(
                 scale=actual_scale,
                 cropbox=ocr_rect,
             )

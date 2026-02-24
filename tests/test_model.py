@@ -128,15 +128,14 @@ class TestRecogniseCrop:
         with pytest.raises(httpx.HTTPStatusError):
             model._recognise_crop(img)
 
-    def test_error_body_logged_on_4xx(self, mock_model):
+    def test_4xx_raises_http_status_error(self, mock_model):
         model, mock_client = mock_model
         mock_client.post.return_value = _make_http_error_response(400)
 
         img = Image.new("RGB", (50, 50))
-        with patch("docling_glm_ocr.model.logger") as mock_logger:
-            with pytest.raises(httpx.HTTPStatusError):
-                model._recognise_crop(img)
-            mock_logger.error.assert_called_once()
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            model._recognise_crop(img)
+        assert exc_info.value.response.status_code == 400
 
 
 class TestRecogniseCropWithRetry:
@@ -291,7 +290,7 @@ class TestDisabledModel:
         pages = list(model(MagicMock(), [mock_page]))
         assert pages == [mock_page]
 
-    def test_disabled_model_has_no_client(self):
+    def test_disabled_model_get_client_raises(self):
         from docling.datamodel.accelerator_options import AcceleratorOptions
 
         opts = GlmOcrRemoteOptions()
@@ -302,17 +301,18 @@ class TestDisabledModel:
             accelerator_options=AcceleratorOptions(),
         )
 
-        assert not hasattr(model, "_client")
+        with pytest.raises(RuntimeError, match="not enabled"):
+            model._get_client()
 
 
 class TestModelInit:
-    def test_enabled_model_creates_client(self, mock_model):
-        model, _ = mock_model
-        assert hasattr(model, "_client")
+    def test_enabled_model_get_client_returns_client(self, mock_model):
+        model, mock_client = mock_model
+        assert model._get_client() is mock_client
 
     def test_scale_is_set(self, mock_model):
         model, _ = mock_model
-        assert model.scale == 3
+        assert model.options.scale == pytest.approx(3.0)
 
     def test_options_stored(self, mock_model):
         model, _ = mock_model
@@ -607,7 +607,7 @@ class TestCall:
             list(model(MagicMock(), [page]))
 
         actual_scale = page._backend.get_page_image.call_args[1]["scale"]
-        assert actual_scale < model.scale
+        assert actual_scale < model.options.scale
         assert actual_scale == pytest.approx((4_500_000 / 1_000_000) ** 0.5, rel=1e-3)
 
     def test_scale_not_capped_for_small_crop(self, mock_model):
@@ -630,4 +630,4 @@ class TestCall:
             list(model(MagicMock(), [page]))
 
         actual_scale = page._backend.get_page_image.call_args[1]["scale"]
-        assert actual_scale == model.scale
+        assert actual_scale == model.options.scale
