@@ -3,6 +3,6 @@
 from docling_glm_ocr.model import GlmOcrRemoteModel
 
 
-def ocr_engines() -> dict[str, list[type]]:
+def ocr_engines() -> dict[str, list[type[GlmOcrRemoteModel]]]:
     """Return the OCR engine classes provided by this plugin."""
     return {"ocr_engines": [GlmOcrRemoteModel]}
