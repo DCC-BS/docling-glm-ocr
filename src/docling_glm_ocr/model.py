@@ -11,8 +11,9 @@ import base64
 import concurrent.futures
 import io
 import logging
+import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import httpx
 from docling.datamodel.base_models import DoclingComponentType, ErrorItem
@@ -35,8 +36,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_HTTP_CLIENT_ERROR_MIN = 400
-_HTTP_SERVER_ERROR_MIN = 500
+_HTTP_CLIENT_ERROR_MIN: Final = 400
+_HTTP_SERVER_ERROR_MIN: Final = 500
 
 
 def _pil_to_base64_uri(image: Image.Image, fmt: str = "PNG") -> str:
@@ -57,6 +58,12 @@ class GlmOcrRemoteModel(BaseOcrModel):
         options: GlmOcrRemoteOptions,
         accelerator_options: AcceleratorOptions,
     ) -> None:
+        """Initialise the OCR engine.
+
+        The httpx client is created lazily per thread on first use, so the
+        model is safe to call from concurrent worker threads.  No client is
+        created when ``enabled`` is ``False``.
+        """
         super().__init__(
             enabled=enabled,
             artifacts_path=artifacts_path,
@@ -64,19 +71,34 @@ class GlmOcrRemoteModel(BaseOcrModel):
             accelerator_options=accelerator_options,
         )
         self.options: GlmOcrRemoteOptions
-        self.scale = self.options.scale
+        self._local = threading.local()
 
         if self.enabled:
-            limits = httpx.Limits(
-                max_connections=self.options.max_concurrent_requests,
-                max_keepalive_connections=self.options.max_concurrent_requests,
-            )
-            self._client = httpx.Client(timeout=self.options.timeout, limits=limits)
             logger.info(
                 "GlmOcrRemoteModel initialised: api_url=%s  model=%s",
                 self.options.api_url,
                 self.options.model_name,
             )
+
+    def _get_client(self) -> httpx.Client:
+        """Return the thread-local httpx client, creating it on first use per thread.
+
+        Each worker thread gets its own ``httpx.Client`` so concurrent requests
+        from the ``ThreadPoolExecutor`` never share connection state.
+
+        Raises:
+            RuntimeError: If the model is not enabled.
+        """
+        if not self.enabled:
+            msg = "GlmOcrRemoteModel is not enabled"
+            raise RuntimeError(msg)
+        if not hasattr(self._local, "client"):
+            limits = httpx.Limits(
+                max_connections=self.options.max_concurrent_requests,
+                max_keepalive_connections=self.options.max_concurrent_requests,
+            )
+            self._local.client = httpx.Client(timeout=self.options.timeout, limits=limits)
+        return self._local.client  # type: ignore[return-value]
 
     def _recognise_crop(self, image: Image.Image) -> str:
         """Send a single cropped image to the remote GLM-OCR endpoint."""
@@ -94,14 +116,7 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 }
             ],
         }
-        resp = self._client.post(self.options.api_url, json=payload)
-        if resp.status_code >= _HTTP_CLIENT_ERROR_MIN:
-            logger.error(
-                "vLLM returned HTTP %d for %s: %s",
-                resp.status_code,
-                self.options.api_url,
-                resp.text,
-            )
+        resp = self._get_client().post(self.options.api_url, json=payload)
         resp.raise_for_status()
         choices = resp.json().get("choices", [])
         if not choices:
@@ -129,17 +144,19 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 if attempt == max_retries:
                     logger.exception("GLM-OCR remote call failed after %d retries", max_retries)
                     raise
-            except httpx.HTTPError:
+                logger.debug("HTTP %d from vLLM on attempt %d", exc.response.status_code, attempt + 1)
+            except httpx.HTTPError as exc:
                 # Network / timeout errors — always retry
                 if attempt == max_retries:
                     logger.exception("GLM-OCR remote call failed after %d retries", max_retries)
                     raise
+                logger.debug("Network error on attempt %d: %s", attempt + 1, exc)
 
             sleep_time = backoff**attempt
             logger.warning(
                 "GLM-OCR remote call failed (attempt %d/%d). Retrying in %.1f seconds...",
                 attempt + 1,
-                max_retries,
+                max_retries + 1,
                 sleep_time,
             )
             time.sleep(sleep_time)
@@ -151,6 +168,17 @@ class GlmOcrRemoteModel(BaseOcrModel):
         ocr_rect: BoundingBox,
         image: Image.Image | None,
     ) -> tuple[TextCell | None, str | None]:
+        """OCR a single pre-extracted crop and convert it to a ``TextCell``.
+
+        Designed to run inside a ``ThreadPoolExecutor`` worker.  Returns a
+        ``(cell, None)`` pair on success, ``(None, error_message)`` when the
+        remote call fails, or ``(None, None)`` when the image is empty or the
+        model returns no text.
+
+        The bounding box is converted from the page's native coordinate space
+        to a ``BoundingRectangle`` with ``CoordOrigin.TOPLEFT`` as required by
+        docling's text-cell contract.
+        """
         if image is None:
             return None, None
 
@@ -213,16 +241,16 @@ class GlmOcrRemoteModel(BaseOcrModel):
             native_pixels = crop_w * crop_h
             if native_pixels > 0:
                 max_safe_scale = (self.options.max_image_pixels / native_pixels) ** 0.5
-                actual_scale = min(self.scale, max_safe_scale)
+                actual_scale = min(self.options.scale, max_safe_scale)
             else:
-                actual_scale = self.scale
-            if actual_scale < self.scale:
+                actual_scale = self.options.scale
+            if actual_scale < self.options.scale:
                 logger.debug(
                     "Crop (%dx%d page-units) would exceed max_image_pixels=%d at scale=%.1f; reducing to scale=%.2f",
                     int(crop_w),
                     int(crop_h),
                     self.options.max_image_pixels,
-                    self.scale,
+                    self.options.scale,
                     actual_scale,
                 )
             high_res_image = page._backend.get_page_image(  # noqa: SLF001
