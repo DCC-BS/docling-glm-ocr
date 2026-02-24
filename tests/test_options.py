@@ -49,6 +49,26 @@ class TestDefaults:
         opts = GlmOcrRemoteOptions()
         assert len(opts.prompt.strip()) > 0
 
+    def test_default_scale(self):
+        opts = GlmOcrRemoteOptions()
+        assert opts.scale == 3.0
+
+    def test_default_max_image_pixels(self):
+        opts = GlmOcrRemoteOptions()
+        assert opts.max_image_pixels == 4_500_000
+
+    def test_default_max_concurrent_requests(self):
+        opts = GlmOcrRemoteOptions()
+        assert opts.max_concurrent_requests == 10
+
+    def test_default_max_retries(self):
+        opts = GlmOcrRemoteOptions()
+        assert opts.max_retries == 3
+
+    def test_default_retry_backoff_factor(self):
+        opts = GlmOcrRemoteOptions()
+        assert opts.retry_backoff_factor == 2.0
+
 
 class TestCustomValues:
     def test_custom_api_url(self):

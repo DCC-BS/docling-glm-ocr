@@ -15,6 +15,7 @@ import time
 from typing import TYPE_CHECKING
 
 import httpx
+from docling.datamodel.base_models import DoclingComponentType, ErrorItem
 from docling.models.base_ocr_model import BaseOcrModel
 from docling.utils.profiling import TimeRecorder
 from docling_core.types.doc import BoundingBox, CoordOrigin
@@ -33,6 +34,9 @@ if TYPE_CHECKING:
     from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+_HTTP_CLIENT_ERROR_MIN = 400
+_HTTP_SERVER_ERROR_MIN = 500
 
 
 def _pil_to_base64_uri(image: Image.Image, fmt: str = "PNG") -> str:
@@ -91,6 +95,13 @@ class GlmOcrRemoteModel(BaseOcrModel):
             ],
         }
         resp = self._client.post(self.options.api_url, json=payload)
+        if resp.status_code >= _HTTP_CLIENT_ERROR_MIN:
+            logger.error(
+                "vLLM returned HTTP %d for %s: %s",
+                resp.status_code,
+                self.options.api_url,
+                resp.text,
+            )
         resp.raise_for_status()
         choices = resp.json().get("choices", [])
         if not choices:
@@ -98,26 +109,40 @@ class GlmOcrRemoteModel(BaseOcrModel):
         return choices[0].get("message", {}).get("content", "")
 
     def _recognise_crop_with_retry(self, image: Image.Image) -> str:
-        """Send a single cropped image with retry logic."""
+        """Send a single cropped image with retry logic.
+
+        4xx responses are not retried — they represent a deterministic client error
+        (e.g. image too large for the server's encoder cache) that will never resolve
+        by repeating the same request. Only 5xx and network/timeout errors are retried.
+        """
         max_retries = self.options.max_retries
         backoff = self.options.retry_backoff_factor
 
         for attempt in range(max_retries + 1):
             try:
                 return self._recognise_crop(image)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code < _HTTP_SERVER_ERROR_MIN:
+                    # 4xx — deterministic client error, do not retry
+                    raise
+                # 5xx — server error, may be transient
+                if attempt == max_retries:
+                    logger.exception("GLM-OCR remote call failed after %d retries", max_retries)
+                    raise
             except httpx.HTTPError:
+                # Network / timeout errors — always retry
                 if attempt == max_retries:
                     logger.exception("GLM-OCR remote call failed after %d retries", max_retries)
                     raise
 
-                sleep_time = backoff**attempt
-                logger.warning(
-                    "GLM-OCR remote call failed (attempt %d/%d). Retrying in %.1f seconds...",
-                    attempt + 1,
-                    max_retries,
-                    sleep_time,
-                )
-                time.sleep(sleep_time)
+            sleep_time = backoff**attempt
+            logger.warning(
+                "GLM-OCR remote call failed (attempt %d/%d). Retrying in %.1f seconds...",
+                attempt + 1,
+                max_retries,
+                sleep_time,
+            )
+            time.sleep(sleep_time)
         return ""
 
     def _process_crop(
@@ -125,17 +150,26 @@ class GlmOcrRemoteModel(BaseOcrModel):
         cell_idx: int,
         ocr_rect: BoundingBox,
         image: Image.Image | None,
-    ) -> TextCell | None:
+    ) -> tuple[TextCell | None, str | None]:
         if image is None:
-            return None
+            return None, None
 
         try:
             text = self._recognise_crop_with_retry(image)
-        except httpx.HTTPError:
-            return None
+        except httpx.HTTPStatusError as exc:
+            # 4xx — deterministic rejection (e.g. image too large for encoder cache)
+            msg = (
+                f"OCR crop index={cell_idx} rejected by vLLM:"
+                f" HTTP {exc.response.status_code} — {exc.response.text[:200]}"
+            )
+            return None, msg
+        except httpx.HTTPError as exc:
+            # 5xx / network — exhausted retries
+            msg = f"OCR crop index={cell_idx} failed after {self.options.max_retries} retries: {exc}"
+            return None, msg
 
         if not text.strip():
-            return None
+            return None, None
 
         return TextCell(
             index=cell_idx,
@@ -154,7 +188,49 @@ class GlmOcrRemoteModel(BaseOcrModel):
                     origin=CoordOrigin.TOPLEFT,
                 )
             ),
-        )
+        ), None
+
+    def _collect_crops(
+        self,
+        page: Page,
+        ocr_rects: list[BoundingBox],
+    ) -> list[tuple[int, BoundingBox, Image.Image | None]]:
+        """Extract crop images for all OCR regions sequentially.
+
+        Images are gathered in the calling thread to avoid thread-safety issues
+        with the PDF backend. Scale is capped so the extracted image never
+        exceeds ``max_image_pixels``, keeping the vLLM encoder token count
+        within its pre-allocated cache.
+        """
+        crop_data: list[tuple[int, BoundingBox, Image.Image | None]] = []
+        for cell_idx, ocr_rect in enumerate(ocr_rects):
+            if ocr_rect.area() == 0:
+                crop_data.append((cell_idx, ocr_rect, None))
+                continue
+
+            crop_w = ocr_rect.r - ocr_rect.l
+            crop_h = ocr_rect.b - ocr_rect.t
+            native_pixels = crop_w * crop_h
+            if native_pixels > 0:
+                max_safe_scale = (self.options.max_image_pixels / native_pixels) ** 0.5
+                actual_scale = min(self.scale, max_safe_scale)
+            else:
+                actual_scale = self.scale
+            if actual_scale < self.scale:
+                logger.debug(
+                    "Crop (%dx%d page-units) would exceed max_image_pixels=%d at scale=%.1f; reducing to scale=%.2f",
+                    int(crop_w),
+                    int(crop_h),
+                    self.options.max_image_pixels,
+                    self.scale,
+                    actual_scale,
+                )
+            high_res_image = page._backend.get_page_image(  # noqa: SLF001
+                scale=actual_scale,
+                cropbox=ocr_rect,
+            )
+            crop_data.append((cell_idx, ocr_rect, high_res_image))
+        return crop_data
 
     def __call__(
         self,
@@ -175,17 +251,7 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 ocr_rects = self.get_ocr_rects(page)
                 all_ocr_cells: list[TextCell] = []
 
-                # Extract all images sequentially to avoid thread-safety issues with the PDF backend
-                crop_data = []
-                for cell_idx, ocr_rect in enumerate(ocr_rects):
-                    if ocr_rect.area() == 0:
-                        crop_data.append((cell_idx, ocr_rect, None))
-                    else:
-                        high_res_image = page._backend.get_page_image(  # noqa: SLF001
-                            scale=self.scale,
-                            cropbox=ocr_rect,
-                        )
-                        crop_data.append((cell_idx, ocr_rect, high_res_image))
+                crop_data = self._collect_crops(page, ocr_rects)
 
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=self.options.max_concurrent_requests
@@ -196,9 +262,17 @@ class GlmOcrRemoteModel(BaseOcrModel):
                     ]
 
                     for future in concurrent.futures.as_completed(futures):
-                        cell = future.result()
+                        cell, error_msg = future.result()
                         if cell is not None:
                             all_ocr_cells.append(cell)
+                        if error_msg is not None:
+                            conv_res.errors.append(
+                                ErrorItem(
+                                    component_type=DoclingComponentType.MODEL,
+                                    module_name=__name__,
+                                    error_message=error_msg,
+                                )
+                            )
 
                 # Sort by index to maintain deterministic sequential order
                 all_ocr_cells.sort(key=lambda c: c.index)

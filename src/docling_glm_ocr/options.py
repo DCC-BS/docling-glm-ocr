@@ -43,6 +43,7 @@ class GlmOcrRemoteOptions(OcrOptions):
     timeout: float = 120
     max_tokens: int = 16384
     scale: float = 3.0
+    max_image_pixels: int = 4_500_000
     max_concurrent_requests: int = 10
     max_retries: int = 3
     retry_backoff_factor: float = 2.0
