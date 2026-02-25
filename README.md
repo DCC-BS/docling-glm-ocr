@@ -98,29 +98,43 @@ plugin is loaded automatically.
 
 ## Configuration
 
+All options can be set via environment variables (useful for Docker / Compose
+deployments) or programmatically via `GlmOcrRemoteOptions`.  Explicit
+constructor arguments always take precedence over environment variables.
+
 ### Environment variables
 
 | Variable | Description | Default |
 |---|---|---|
 | `GLMOCR_REMOTE_OCR_API_URL` | vLLM chat completion URL | `http://localhost:8001/v1/chat/completions` |
+| `GLMOCR_REMOTE_OCR_MODEL_NAME` | Model name sent to vLLM | `zai-org/GLM-OCR` |
 | `GLMOCR_REMOTE_OCR_PROMPT` | Text prompt sent with each image crop | see below |
+| `GLMOCR_REMOTE_OCR_TIMEOUT` | HTTP timeout per crop (seconds) | `120` |
+| `GLMOCR_REMOTE_OCR_MAX_TOKENS` | Max tokens per completion | `16384` |
+| `GLMOCR_REMOTE_OCR_SCALE` | Image crop rendering scale | `3.0` |
+| `GLMOCR_REMOTE_OCR_MAX_IMAGE_PIXELS` | Pixel budget per crop | `4500000` |
+| `GLMOCR_REMOTE_OCR_MAX_CONCURRENT_REQUESTS` | Max concurrent API requests | `10` |
+| `GLMOCR_REMOTE_OCR_MAX_RETRIES` | Max retry attempts for HTTP errors | `3` |
+| `GLMOCR_REMOTE_OCR_RETRY_BACKOFF_FACTOR` | Exponential backoff factor for retries | `2.0` |
+| `GLMOCR_REMOTE_OCR_LANG` | Comma-separated language hint(s) | `en` |
 
 ### `GlmOcrRemoteOptions`
 
-All options can be set programmatically via `GlmOcrRemoteOptions`:
+All options can also be set programmatically via `GlmOcrRemoteOptions`:
 
 | Option | Type | Description | Default |
 |---|---|---|---|
 | `api_url` | `str` | OpenAI-compatible chat completion URL | `GLMOCR_REMOTE_OCR_API_URL` env or `http://localhost:8001/v1/chat/completions` |
-| `model_name` | `str` | Model name sent to vLLM | `zai-org/GLM-OCR` |
+| `model_name` | `str` | Model name sent to vLLM | `GLMOCR_REMOTE_OCR_MODEL_NAME` env or `zai-org/GLM-OCR` |
 | `prompt` | `str` | Text prompt for each image crop | `GLMOCR_REMOTE_OCR_PROMPT` env or default prompt |
-| `timeout` | `float` | HTTP timeout per crop (seconds) | `120` |
-| `max_tokens` | `int` | Max tokens per completion | `16384` |
-| `scale` | `float` | Image crop rendering scale | `3.0` |
-| `max_concurrent_requests` | `int` | Max concurrent API requests | `10` |
-| `max_retries` | `int` | Max retry attempts for HTTP errors | `3` |
-| `retry_backoff_factor` | `float` | Exponential backoff factor for retries | `2.0` |
-| `lang` | `list[str]` | Language hint (passed to docling) | `["en"]` |
+| `timeout` | `float` | HTTP timeout per crop (seconds) | `GLMOCR_REMOTE_OCR_TIMEOUT` env or `120` |
+| `max_tokens` | `int` | Max tokens per completion | `GLMOCR_REMOTE_OCR_MAX_TOKENS` env or `16384` |
+| `scale` | `float` | Image crop rendering scale | `GLMOCR_REMOTE_OCR_SCALE` env or `3.0` |
+| `max_image_pixels` | `int` | Pixel budget per crop | `GLMOCR_REMOTE_OCR_MAX_IMAGE_PIXELS` env or `4500000` |
+| `max_concurrent_requests` | `int` | Max concurrent API requests | `GLMOCR_REMOTE_OCR_MAX_CONCURRENT_REQUESTS` env or `10` |
+| `max_retries` | `int` | Max retry attempts for HTTP errors | `GLMOCR_REMOTE_OCR_MAX_RETRIES` env or `3` |
+| `retry_backoff_factor` | `float` | Exponential backoff factor for retries | `GLMOCR_REMOTE_OCR_RETRY_BACKOFF_FACTOR` env or `2.0` |
+| `lang` | `list[str]` | Language hint (passed to docling) | `GLMOCR_REMOTE_OCR_LANG` env (comma-separated) or `["en"]` |
 
 Default prompt:
 
