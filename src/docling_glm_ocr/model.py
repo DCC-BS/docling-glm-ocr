@@ -21,6 +21,7 @@ from docling.models.base_ocr_model import BaseOcrModel
 from docling.utils.profiling import TimeRecorder
 from docling_core.types.doc import BoundingBox, CoordOrigin
 from docling_core.types.doc.page import BoundingRectangle, TextCell
+from PIL import Image
 
 from docling_glm_ocr.options import GlmOcrRemoteOptions
 
@@ -32,7 +33,6 @@ if TYPE_CHECKING:
     from docling.datamodel.base_models import Page
     from docling.datamodel.document import ConversionResult
     from docling.datamodel.pipeline_options import OcrOptions
-    from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +117,13 @@ class GlmOcrRemoteModel(BaseOcrModel):
             ],
         }
         resp = self._get_client().post(self.options.api_url, json=payload)
+        if resp.status_code >= _HTTP_CLIENT_ERROR_MIN:
+            logger.error(
+                "vLLM returned HTTP %d for %s: %s",
+                resp.status_code,
+                self.options.api_url,
+                resp.text,
+            )
         resp.raise_for_status()
         choices = resp.json().get("choices", [])
         if not choices:
@@ -185,15 +192,38 @@ class GlmOcrRemoteModel(BaseOcrModel):
         try:
             text = self._recognise_crop_with_retry(image)
         except httpx.HTTPStatusError as exc:
-            # 4xx — deterministic rejection (e.g. image too large for encoder cache)
-            msg = (
-                f"OCR crop index={cell_idx} rejected by vLLM:"
-                f" HTTP {exc.response.status_code} — {exc.response.text[:200]}"
-            )
-            return None, msg
+            if exc.response.status_code == _HTTP_CLIENT_ERROR_MIN and "encoder cache" in exc.response.text:
+                # Image too large for vLLM encoder cache — retry once at 2/3 scale
+                w, h = image.size
+                reduced = image.resize((int(w * 2 // 3), int(h * 2 // 3)), Image.Resampling.LANCZOS)
+                logger.warning(
+                    "OCR crop index=%d exceeded vLLM encoder cache (%dx%d px); "
+                    "retrying at 2/3 scale (%dx%d px). "
+                    "Consider setting --max-num-batched-tokens 8192 on the vLLM server.",
+                    cell_idx,
+                    w,
+                    h,
+                    reduced.width,
+                    reduced.height,
+                )
+                try:
+                    text = self._recognise_crop_with_retry(reduced)
+                except (httpx.HTTPStatusError, httpx.HTTPError) as exc2:
+                    msg = f"OCR crop index={cell_idx} failed even at reduced scale: {exc2}"
+                    logger.exception(msg)
+                    return None, msg
+            else:
+                # Other 4xx — deterministic rejection, do not retry
+                msg = (
+                    f"OCR crop index={cell_idx} rejected by vLLM:"
+                    f" HTTP {exc.response.status_code} — {exc.response.text[:200]}"
+                )
+                logger.exception(msg)
+                return None, msg
         except httpx.HTTPError as exc:
             # 5xx / network — exhausted retries
             msg = f"OCR crop index={cell_idx} failed after {self.options.max_retries} retries: {exc}"
+            logger.exception(msg)
             return None, msg
 
         if not text.strip():

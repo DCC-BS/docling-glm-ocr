@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import io
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -20,6 +21,20 @@ def _make_ok_response(text: str = "Hello") -> MagicMock:
     resp = MagicMock()
     resp.status_code = 200
     resp.json.return_value = {"choices": [{"message": {"content": text}}]}
+    return resp
+
+
+def _make_encoder_cache_400() -> MagicMock:
+    """Return a mock 400 matching vLLM's encoder-cache-exceeded error body."""
+    body = "image item with length 6120 exceeds the pre-allocated encoder cache size 4800"
+    resp = MagicMock()
+    resp.status_code = 400
+    resp.text = body
+    resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "HTTP 400",
+        request=MagicMock(),
+        response=MagicMock(status_code=400, text=body),
+    )
     return resp
 
 
@@ -272,6 +287,72 @@ class TestProcessCrop:
         assert cell is None
         assert error is not None
         assert "index=2" in error
+
+    def test_encoder_cache_400_retries_at_reduced_scale(self, mock_model):
+        """A 400 with 'encoder cache' in the body triggers a retry at 2/3 scale."""
+        model, mock_client = mock_model
+        mock_client.post.side_effect = [
+            _make_encoder_cache_400(),
+            _make_ok_response("text from reduced scale"),
+        ]
+        ocr_rect = MagicMock()
+        ocr_rect.l, ocr_rect.t, ocr_rect.r, ocr_rect.b = 0, 0, 100, 50
+
+        cell, error = model._process_crop(1, ocr_rect, Image.new("RGB", (900, 600)))
+
+        assert cell is not None
+        assert cell.text == "text from reduced scale"
+        assert error is None
+        assert mock_client.post.call_count == 2
+
+    def test_encoder_cache_400_reduced_image_is_two_thirds(self, mock_model):
+        """The image sent on the retry must be 2/3 the dimensions of the original."""
+        model, mock_client = mock_model
+        captured_sizes: list[tuple[int, int]] = []
+
+        def capture_post(url, **kwargs):
+            data_uri = kwargs["json"]["messages"][0]["content"][1]["image_url"]["url"]
+            b64 = data_uri.split(",", 1)[1]
+            img = Image.open(io.BytesIO(base64.b64decode(b64)))
+            captured_sizes.append(img.size)
+            return _make_encoder_cache_400() if len(captured_sizes) == 1 else _make_ok_response("ok")
+
+        mock_client.post.side_effect = capture_post
+        ocr_rect = MagicMock()
+        ocr_rect.l, ocr_rect.t, ocr_rect.r, ocr_rect.b = 0, 0, 100, 50
+        model._process_crop(1, ocr_rect, Image.new("RGB", (900, 600)))
+
+        assert len(captured_sizes) == 2
+        orig_w, orig_h = captured_sizes[0]
+        reduced_w, reduced_h = captured_sizes[1]
+        assert reduced_w == int(orig_w * 2 // 3)
+        assert reduced_h == int(orig_h * 2 // 3)
+
+    def test_encoder_cache_400_fallback_also_fails_returns_error(self, mock_model):
+        """If the reduced-scale retry also fails, return None and an error message."""
+        model, mock_client = mock_model
+        mock_client.post.return_value = _make_encoder_cache_400()
+        ocr_rect = MagicMock()
+        ocr_rect.l, ocr_rect.t, ocr_rect.r, ocr_rect.b = 0, 0, 100, 50
+
+        cell, error = model._process_crop(4, ocr_rect, Image.new("RGB", (900, 600)))
+
+        assert cell is None
+        assert error is not None
+        assert "reduced scale" in error
+        assert mock_client.post.call_count == 2  # original + one fallback attempt
+
+    def test_non_cache_400_not_retried_with_scale_reduction(self, mock_model):
+        """A 400 without 'encoder cache' in the body fails immediately with no retry."""
+        model, mock_client = mock_model
+        mock_client.post.return_value = _make_http_error_response(400)
+
+        cell, error = model._process_crop(3, MagicMock(), Image.new("RGB", (900, 600)))
+
+        assert cell is None
+        assert error is not None
+        assert "400" in error
+        assert mock_client.post.call_count == 1
 
 
 class TestDisabledModel:

@@ -182,10 +182,36 @@ docker run -d \
   zai-org/GLM-OCR \
   --served-model-name zai-org/GLM-OCR \
   --port 8000 \
-  --trust-remote-code
+  --trust-remote-code \
+  --max-num-batched-tokens 8192
 ```
 
 The plugin will connect to `http://localhost:8001/v1/chat/completions` by default.
+
+### Required: `--max-num-batched-tokens 8192`
+
+> **Without this flag, vLLM will reject any high-resolution image with HTTP 400.**
+
+In vLLM 0.16.0+ (v1 engine), the encoder cache size is derived from
+`max_num_batched_tokens` (default **2048** when chunked prefill is enabled):
+
+```
+encoder_cache_size = max(max_num_batched_tokens, model_max_tokens_per_image)
+                   = max(2048, 4800)  ←  4800 is GLM-OCR's model floor
+                   = 4800 tokens      ←  too small for real documents
+```
+
+The `Glm46VImageProcessor` encodes images at approximately **784 pixels per token**
+(`patch_size=14 × merge_size=2`, squared). A typical A4 page rendered at scale 3×
+(1785 × 2526 px) produces **5760 tokens**; a phone-photo crop at scale 3× can reach
+**6120 tokens** — both exceed the default 4800-token cache and are rejected.
+
+Setting `--max-num-batched-tokens 8192` raises the encoder cache to
+`max(8192, 4800) = 8192` tokens, which covers all real-world inputs with comfortable
+headroom.
+
+> **Note:** `--limit-mm-per-prompt` does **not** control the encoder cache size in
+> vLLM 0.16.0. That flag only limits the *count* of images per request.
 
 ## Development
 
