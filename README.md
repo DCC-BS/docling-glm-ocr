@@ -172,18 +172,17 @@ For each page the model:
 ```bash
 docker run -d \
   --rm --name ocr-glm \
-  --gpus device=0 \
+  --gpus device=1 \
   --ipc=host \
   -p 8001:8000 \
   -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
-  -e "HF_TOKEN=${HF_TOKEN}" \
-  --entrypoint /bin/bash \
-  vllm/vllm-openai:latest \
-  -c "uv pip install --system --upgrade transformers && \
-      exec vllm serve zai-org/GLM-OCR \
-        --served-model-name zai-org/GLM-OCR \
-        --port 8000 \
-        --trust-remote-code"
+  -e "HF_TOKEN=${HF_TOKEN:-}" \
+  -e "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu" \
+  ghcr.io/dcc-bs/vllm:v0.16.0-cu130 \
+  zai-org/GLM-OCR \
+  --served-model-name zai-org/GLM-OCR \
+  --port 8000 \
+  --trust-remote-code
 ```
 
 The plugin will connect to `http://localhost:8001/v1/chat/completions` by default.
