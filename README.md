@@ -178,9 +178,8 @@ docker run -d \
   -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
   -e "HF_TOKEN=${HF_TOKEN:-}" \
   -e "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu" \
-  ghcr.io/dcc-bs/vllm:v0.16.0-cu130 \
+  vllm/vllm-openai:v0.16.0-cu130 \
   zai-org/GLM-OCR \
-  --served-model-name zai-org/GLM-OCR \
   --port 8000 \
   --trust-remote-code \
   --max-num-batched-tokens 8192
