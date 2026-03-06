@@ -117,6 +117,7 @@ constructor arguments always take precedence over environment variables.
 | `GLMOCR_REMOTE_OCR_MAX_RETRIES` | Max retry attempts for HTTP errors | `3` |
 | `GLMOCR_REMOTE_OCR_RETRY_BACKOFF_FACTOR` | Exponential backoff factor for retries | `2.0` |
 | `GLMOCR_REMOTE_OCR_LANG` | Comma-separated language hint(s) | `en` |
+| `GLMOCR_REMOTE_OCR_API_KEY` | Bearer token for `Authorization` header | unset (no header sent) |
 
 ### `GlmOcrRemoteOptions`
 
@@ -135,6 +136,7 @@ All options can also be set programmatically via `GlmOcrRemoteOptions`:
 | `max_retries` | `int` | Max retry attempts for HTTP errors | `GLMOCR_REMOTE_OCR_MAX_RETRIES` env or `3` |
 | `retry_backoff_factor` | `float` | Exponential backoff factor for retries | `GLMOCR_REMOTE_OCR_RETRY_BACKOFF_FACTOR` env or `2.0` |
 | `lang` | `list[str]` | Language hint (passed to docling) | `GLMOCR_REMOTE_OCR_LANG` env (comma-separated) or `["en"]` |
+| `api_key` | `str \| None` | Bearer token sent in `Authorization` header | `GLMOCR_REMOTE_OCR_API_KEY` env or `None` (no header) |
 
 Default prompt:
 

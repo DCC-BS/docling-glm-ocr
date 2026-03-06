@@ -97,7 +97,10 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 max_connections=self.options.max_concurrent_requests,
                 max_keepalive_connections=self.options.max_concurrent_requests,
             )
-            self._local.client = httpx.Client(timeout=self.options.timeout, limits=limits)
+            headers = {}
+            if self.options.api_key:
+                headers["Authorization"] = f"Bearer {self.options.api_key}"
+            self._local.client = httpx.Client(timeout=self.options.timeout, limits=limits, headers=headers)
         return self._local.client
 
     def _recognise_crop(self, image: Image.Image) -> str:

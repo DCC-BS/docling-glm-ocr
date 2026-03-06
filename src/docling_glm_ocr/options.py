@@ -59,10 +59,15 @@ class GlmOcrRemoteOptions(OcrOptions):
             ``GLMOCR_REMOTE_OCR_RETRY_BACKOFF_FACTOR`` env var.
         lang: Language hint list (passed to docling).  Falls back to the
             ``GLMOCR_REMOTE_OCR_LANG`` env var as a comma-separated string.
+        api_key: Bearer token sent in the ``Authorization`` header.  Set this
+            when your vLLM server requires API key authentication.  Falls back
+            to the ``GLMOCR_REMOTE_OCR_API_KEY`` env var.  ``None`` (default)
+            means no ``Authorization`` header is sent.
     """
 
     kind: ClassVar[Literal["glm-ocr-remote"]] = "glm-ocr-remote"
 
+    api_key: str | None = Field(default_factory=lambda: os.environ.get("GLMOCR_REMOTE_OCR_API_KEY") or None)
     lang: list[str] = Field(default_factory=lambda: os.environ.get("GLMOCR_REMOTE_OCR_LANG", "en").split(","))
     api_url: str = Field(default_factory=lambda: os.environ.get("GLMOCR_REMOTE_OCR_API_URL", _DEFAULT_API_URL))
     model_name: str = Field(default_factory=lambda: os.environ.get("GLMOCR_REMOTE_OCR_MODEL_NAME", "zai-org/GLM-OCR"))
