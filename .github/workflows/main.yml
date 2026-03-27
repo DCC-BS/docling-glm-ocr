@@ -13,7 +13,7 @@ jobs:
   # Quality checks via DCC-BS reusable workflow (ruff lint + format + ty)
   # ---------------------------------------------------------------------------
   quality:
-    uses: DCC-BS/ci-workflows/.github/workflows/python-backend-ci.yml@v8
+    uses: DCC-BS/ci-workflows/.github/workflows/python-backend-ci.yml@814649735835a84a3d0d6c8d6e6db87dfeb8b348 # v8
     with:
       python_versions: '["3.13"]'
       quality_python_version: "3.13"
@@ -32,10 +32,10 @@ jobs:
         python-version: ["3.13"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@447e6d02b15d65b3247cce2d6019f11957285d11 # v6
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -50,13 +50,13 @@ jobs:
         run: uv run pytest --cov --cov-report=xml --junitxml=junit.xml
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/test-results-action@v1
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./junit.xml

@@ -150,3 +150,7 @@ exclude_lines = [
     "raise NotImplementedError",
     "@(abc\\.)?abstractmethod",
 ]
+
+[tool.uv]
+exclude-newer = "1 week"
+exclude-newer-package = { dcc-backend-common = "P1D" }
