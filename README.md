@@ -69,11 +69,7 @@ pipeline_options = PdfPipelineOptions(
     ),
 )
 
-converter = DocumentConverter(
-    format_options={
-        InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-    }
-)
+converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)})
 result = converter.convert("document.pdf")
 print(result.document.export_to_markdown())
 ```

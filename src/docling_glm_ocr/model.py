@@ -80,6 +80,23 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 self.options.model_name,
             )
 
+    def get_ocr_rects(self, page: Page) -> list[BoundingBox]:
+        """Compute OCR bounding boxes for page, falling back to full-page if empty."""
+        if page.size is None:
+            return []
+        ocr_rects = super().get_ocr_rects(page)
+        if not ocr_rects:
+            ocr_rects = [
+                BoundingBox(
+                    l=0,
+                    t=0,
+                    r=page.size.width,
+                    b=page.size.height,
+                    coord_origin=CoordOrigin.TOPLEFT,
+                )
+            ]
+        return ocr_rects
+
     def _get_client(self) -> httpx.Client:
         """Return the thread-local httpx client, creating it on first use per thread.
 
@@ -341,7 +358,7 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 # Sort by index to maintain deterministic sequential order
                 all_ocr_cells.sort(key=lambda c: c.index)
 
-                self.post_process_cells(all_ocr_cells, page)
+                self.post_process_cells(all_ocr_cells, page, conv_res)
 
             yield page
 
