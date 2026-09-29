@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import html
 import io
 import logging
+import re
 import threading
 import time
+from collections import Counter
 from typing import TYPE_CHECKING, Final
 
 import httpx
@@ -39,12 +42,92 @@ logger = logging.getLogger(__name__)
 _HTTP_CLIENT_ERROR_MIN: Final = 400
 _HTTP_SERVER_ERROR_MIN: Final = 500
 
+# Lower bound for the per-crop token budget, so small crops can still hold a few lines.
+_MIN_CROP_MAX_TOKENS: Final = 256
+# A crop's output counts as a repetition loop when one line makes up this share of it ...
+_LOOP_LINE_SHARE: Final = 0.3
+# ... and occurs at least this often, or when the text ends in a unit repeated this often.
+_LOOP_MIN_REPEATS: Final = 8
+_LOOP_MIN_LINES: Final = 10
+_WRAPPING_FENCE = re.compile(r"^\s*```[\w-]*[ \t]*\n(.*?)\n?\s*```\s*$", re.DOTALL)
+_STRAY_FENCE_LINE = re.compile(r"^[ \t]*```[\w-]*[ \t]*$", re.MULTILINE)
+_HTML_TABLE = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
+_HTML_ROW = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
+_HTML_CELL = re.compile(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", re.DOTALL | re.IGNORECASE)
+_HTML_TAG = re.compile(r"<[^>]+>")
+# Output lines at least this long that match a prompt line count as an echo of the prompt.
+_MIN_ECHO_CHARS: Final = 15
+_REPEATED_TAIL = re.compile(rf"(.{{2,40}}?)(?:\s*\1){{{_LOOP_MIN_REPEATS - 1},}}\s*$", re.DOTALL)
+
 
 def _pil_to_base64_uri(image: Image.Image, fmt: str = "PNG") -> str:
     buf = io.BytesIO()
     image.save(buf, format=fmt)
     b64 = base64.b64encode(buf.getvalue()).decode()
     return f"data:image/{fmt.lower()};base64,{b64}"
+
+
+def _html_table_to_text(match: re.Match[str]) -> str:
+    rows = []
+    for row in _HTML_ROW.findall(match.group(0)):
+        cells = (" ".join(html.unescape(_HTML_TAG.sub(" ", cell)).split()) for cell in _HTML_CELL.findall(row))
+        line = " ".join(cell for cell in cells if cell)
+        if line:
+            rows.append(line)
+    return "\n".join(rows)
+
+
+def clean_ocr_text(text: str) -> str:
+    """Turn GLM-OCR's markdown-ish answer into plain text for a docling text cell.
+
+    GLM-OCR sometimes wraps its answer in a code fence and writes tables as HTML. Docling
+    expects plain text in OCR cells (it builds the document structure itself), so fences
+    are removed and each table row becomes one line with its cells separated by spaces.
+    """
+    fenced = _WRAPPING_FENCE.match(text)
+    text = fenced.group(1) if fenced else _STRAY_FENCE_LINE.sub("", text)
+    if "<t" in text.lower():
+        text = _HTML_TABLE.sub(_html_table_to_text, text)
+    return text.strip()
+
+
+def _normalise_line(line: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", " ", line.lower()).split())
+
+
+def strip_prompt_echo(text: str, prompt: str) -> str:
+    """Remove lines in which the model repeats its own instructions.
+
+    On images without text GLM-OCR sometimes answers with (parts of) the prompt, e.g.
+    "Preserve the original layout (headings/paragraphs/tables/formulas)".
+    """
+    prompt_lines = [n for n in (_normalise_line(line) for line in prompt.splitlines()) if len(n) >= _MIN_ECHO_CHARS]
+    if not prompt_lines:
+        return text
+    kept = []
+    for line in text.splitlines():
+        normalised = _normalise_line(line)
+        echoed = len(normalised) >= _MIN_ECHO_CHARS and any(
+            normalised in prompt_line or prompt_line in normalised for prompt_line in prompt_lines
+        )
+        if not echoed:
+            kept.append(line)
+    return "\n".join(kept)
+
+
+def is_repetition_loop(text: str) -> bool:
+    """Detect the degenerate output a VLM produces when it loops.
+
+    Typical case: asked to read a text-free photo, GLM-OCR invents a few words and then
+    repeats one of them hundreds of times. Such output is discarded rather than cleaned,
+    because the words before the loop are usually invented too.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) >= _LOOP_MIN_LINES:
+        _, count = Counter(lines).most_common(1)[0]
+        if count >= _LOOP_MIN_REPEATS and count / len(lines) >= _LOOP_LINE_SHARE:
+            return True
+    return bool(_REPEATED_TAIL.search(text[-600:]))
 
 
 class GlmOcrRemoteModel(BaseOcrModel):
@@ -81,11 +164,17 @@ class GlmOcrRemoteModel(BaseOcrModel):
             )
 
     def get_ocr_rects(self, page: Page) -> list[BoundingBox]:
-        """Compute OCR bounding boxes for page, falling back to full-page if empty."""
+        """Compute OCR bounding boxes for the page.
+
+        When docling selects no region, the page is OCR'd as a whole only if it has no
+        PDF text at all (a photo or an image-only scan whose layout detection found
+        nothing). A page with PDF text and no selected region needs no OCR: sending it
+        to the VLM costs seconds per page and only adds duplicate or invented text.
+        """
         if page.size is None:
             return []
         ocr_rects = super().get_ocr_rects(page)
-        if not ocr_rects:
+        if not ocr_rects and not self._has_pdf_text(page):
             ocr_rects = [
                 BoundingBox(
                     l=0,
@@ -96,6 +185,22 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 )
             ]
         return ocr_rects
+
+    @staticmethod
+    def _has_pdf_text(page: Page) -> bool:
+        cells = getattr(page, "cells", None) or []
+        return any(cell.text.strip() for cell in cells if not getattr(cell, "from_ocr", False))
+
+    def _crop_max_tokens(self, image: Image.Image) -> int:
+        """Token budget for one crop: proportional to its size, capped by ``max_tokens``.
+
+        Bounds the damage (and the time) of a repetition loop on small crops.
+        """
+        per_megapixel = self.options.max_tokens_per_megapixel
+        if per_megapixel <= 0:
+            return self.options.max_tokens
+        budget = int(image.width * image.height / 1_000_000 * per_megapixel)
+        return max(_MIN_CROP_MAX_TOKENS, min(self.options.max_tokens, budget))
 
     def _get_client(self) -> httpx.Client:
         """Return the thread-local httpx client, creating it on first use per thread.
@@ -121,11 +226,15 @@ class GlmOcrRemoteModel(BaseOcrModel):
         return self._local.client
 
     def _recognise_crop(self, image: Image.Image) -> str:
-        """Send a single cropped image to the remote GLM-OCR endpoint."""
+        """Send a single cropped image to the remote GLM-OCR endpoint.
+
+        Returns cleaned plain text, or an empty string when the answer is a repetition loop.
+        """
         data_uri = _pil_to_base64_uri(image)
+        max_tokens = self._crop_max_tokens(image)
         payload = {
             "model": self.options.model_name,
-            "max_tokens": self.options.max_tokens,
+            "max_tokens": max_tokens,
             "messages": [
                 {
                     "role": "user",
@@ -148,7 +257,27 @@ class GlmOcrRemoteModel(BaseOcrModel):
         choices = resp.json().get("choices", [])
         if not choices:
             return ""
-        return choices[0].get("message", {}).get("content", "")
+        text = choices[0].get("message", {}).get("content", "") or ""
+        if is_repetition_loop(text):
+            logger.warning(
+                "Discarding GLM-OCR output for a %dx%d px crop: repetition loop (finish_reason=%s, %d chars)",
+                image.width,
+                image.height,
+                choices[0].get("finish_reason"),
+                len(text),
+            )
+            return ""
+        if choices[0].get("finish_reason") == "length":
+            logger.warning(
+                "GLM-OCR output for a %dx%d px crop was cut at max_tokens=%d", image.width, image.height, max_tokens
+            )
+        text = clean_ocr_text(text)
+        cleaned = strip_prompt_echo(text, self.options.prompt).strip()
+        if cleaned != text:
+            logger.warning(
+                "Removed an echo of the prompt from GLM-OCR output for a %dx%d px crop", image.width, image.height
+            )
+        return cleaned
 
     def _recognise_crop_with_retry(self, image: Image.Image) -> str:
         """Send a single cropped image with retry logic.

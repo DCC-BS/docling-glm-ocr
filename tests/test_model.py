@@ -12,7 +12,13 @@ from docling.datamodel.base_models import DoclingComponentType
 from docling.datamodel.pipeline_options import OcrOptions
 from PIL import Image
 
-from docling_glm_ocr.model import GlmOcrRemoteModel, _pil_to_base64_uri
+from docling_glm_ocr.model import (
+    GlmOcrRemoteModel,
+    _pil_to_base64_uri,
+    clean_ocr_text,
+    is_repetition_loop,
+    strip_prompt_echo,
+)
 from docling_glm_ocr.options import GlmOcrRemoteOptions
 
 
@@ -92,7 +98,8 @@ class TestRecogniseCrop:
 
         payload = call_args[1]["json"]
         assert payload["model"] == "test-model"
-        assert payload["max_tokens"] == 16384
+        # 50x50 px crop: the per-crop budget's lower bound, not the global max_tokens
+        assert payload["max_tokens"] == 256
         assert len(payload["messages"]) == 1
         assert payload["messages"][0]["role"] == "user"
 
@@ -712,3 +719,150 @@ class TestCall:
 
         actual_scale = page._backend.get_page_image.call_args[1]["scale"]
         assert actual_scale == model.options.scale
+
+
+def _make_response(content: str, finish_reason: str = "stop") -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"choices": [{"message": {"content": content}, "finish_reason": finish_reason}]}
+    return resp
+
+
+class TestCropMaxTokens:
+    def test_budget_scales_with_crop_size(self, mock_model):
+        model, _ = mock_model
+        assert model._crop_max_tokens(Image.new("RGB", (1000, 1000))) == 2500
+        assert model._crop_max_tokens(Image.new("RGB", (2000, 2000))) == 10000
+
+    def test_budget_bounded_by_min_and_max_tokens(self, mock_model):
+        model, _ = mock_model
+        assert model._crop_max_tokens(Image.new("RGB", (10, 10))) == 256
+        assert model._crop_max_tokens(Image.new("RGB", (4000, 4000))) == model.options.max_tokens
+
+    def test_zero_disables_the_budget(self, mock_model):
+        model, _ = mock_model
+        model.options.max_tokens_per_megapixel = 0
+        assert model._crop_max_tokens(Image.new("RGB", (10, 10))) == model.options.max_tokens
+
+
+class TestFullPageFallback:
+    @staticmethod
+    def _page(cells: list) -> MagicMock:
+        page = MagicMock()
+        page.size.width, page.size.height = 600.0, 800.0
+        page.cells = cells
+        return page
+
+    @staticmethod
+    def _cell(text: str, *, from_ocr: bool = False) -> MagicMock:
+        cell = MagicMock()
+        cell.text, cell.from_ocr = text, from_ocr
+        return cell
+
+    def test_page_without_pdf_text_falls_back_to_full_page(self, mock_model):
+        model, _ = mock_model
+        with patch("docling.models.base_ocr_model.BaseOcrModel.get_ocr_rects", return_value=[]):
+            rects = model.get_ocr_rects(self._page([]))
+        assert len(rects) == 1
+        assert (rects[0].l, rects[0].t, rects[0].r, rects[0].b) == (0, 0, 600.0, 800.0)
+
+    def test_page_with_pdf_text_and_no_regions_is_not_ocred(self, mock_model):
+        """Regression: born-digital pages were sent to the VLM as a whole (CELEX: 30 s/page)."""
+        model, _ = mock_model
+        with patch("docling.models.base_ocr_model.BaseOcrModel.get_ocr_rects", return_value=[]):
+            assert model.get_ocr_rects(self._page([self._cell("Artikel 1")])) == []
+
+    def test_ocr_cells_and_blank_cells_do_not_count_as_pdf_text(self, mock_model):
+        model, _ = mock_model
+        cells = [self._cell("   "), self._cell("from an earlier OCR pass", from_ocr=True)]
+        with patch("docling.models.base_ocr_model.BaseOcrModel.get_ocr_rects", return_value=[]):
+            assert len(model.get_ocr_rects(self._page(cells))) == 1
+
+    def test_selected_regions_are_returned_unchanged(self, mock_model):
+        from docling_core.types.doc import BoundingBox
+
+        model, _ = mock_model
+        region = BoundingBox(l=10, t=20, r=110, b=60)
+        with patch("docling.models.base_ocr_model.BaseOcrModel.get_ocr_rects", return_value=[region]):
+            assert model.get_ocr_rects(self._page([])) == [region]
+
+
+class TestCleanOcrText:
+    def test_wrapping_code_fence_removed(self):
+        assert clean_ocr_text("```markdown\nHello\nWorld\n```") == "Hello\nWorld"
+
+    def test_stray_fence_lines_removed(self):
+        assert clean_ocr_text("Intro\n```markdown\n\nBody") == "Intro\n\n\nBody"
+
+    def test_html_table_becomes_one_line_per_row(self):
+        text = (
+            '<table border="1"><tr><th align="left">Tel</th><td>061 267 87 27</td></tr>'
+            "<tr><td>E-Mail</td><td>stata@bs.ch &amp; info</td></tr></table>"
+        )
+        assert clean_ocr_text(text) == "Tel 061 267 87 27\nE-Mail stata@bs.ch & info"
+
+    def test_text_around_table_kept(self):
+        assert clean_ocr_text("Kontakt\n<table><tr><td>A</td><td>B</td></tr></table>\nEnde") == "Kontakt\nA B\nEnde"
+
+    def test_plain_text_unchanged(self):
+        assert clean_ocr_text("  Basel, 14. Februar 2025\nBetreff  ") == "Basel, 14. Februar 2025\nBetreff"
+
+
+class TestRepetitionLoop:
+    def test_line_loop_detected(self):
+        """The Legislaturplan photo page: invented words, then one word repeated hundreds of times."""
+        text = "Presidenta\nDie Regierung\nDasselt\nWilhelmstadt\n" + "Wiesbaden\n" * 40
+        assert is_repetition_loop(text)
+
+    def test_inline_loop_at_the_end_detected(self):
+        assert is_repetition_loop("Some text " + "la la " * 30)
+
+    def test_normal_text_not_flagged(self):
+        text = "\n".join(f"Line {i} of an ordinary page" for i in range(40))
+        assert not is_repetition_loop(text)
+
+    def test_legitimate_repeats_not_flagged(self):
+        """A table column with a few repeated values stays below the share threshold."""
+        rows = [f"Position {i} 0" for i in range(30)] + ["0"] * 5
+        assert not is_repetition_loop("\n".join(rows))
+
+    def test_loop_output_discarded(self, mock_model):
+        model, mock_client = mock_model
+        mock_client.post.return_value = _make_response("Presidenta\n" + "Wiesbaden\n" * 60, "length")
+        assert model._recognise_crop(Image.new("RGB", (400, 400))) == ""
+
+    def test_clean_output_returned(self, mock_model):
+        model, mock_client = mock_model
+        mock_client.post.return_value = _make_response("```markdown\n<table><tr><td>A</td><td>B</td></tr></table>\n```")
+        assert model._recognise_crop(Image.new("RGB", (400, 400))) == "A B"
+
+
+class TestPromptEcho:
+    PROMPT = (
+        "Recognize the text in the image and output in Markdown format.\n"
+        "Preserve the original layout (headings/paragraphs/tables/formulas).\n"
+        "Do not fabricate content that does not exist in the image."
+    )
+
+    def test_echoed_prompt_lines_removed(self):
+        """Seen on a text-free photo page: GLM-OCR answered with its own instructions."""
+        text = (
+            "Preserve the original layout (headings/paragraphs/tables/formulas)\n"
+            "Do not fabricate content that does not exist in the image."
+        )
+        assert strip_prompt_echo(text, self.PROMPT).strip() == ""
+
+    def test_real_text_kept_next_to_an_echo(self):
+        text = "Legislaturplan 2025-2029\nDo not fabricate content that does not exist in the image."
+        assert strip_prompt_echo(text, self.PROMPT) == "Legislaturplan 2025-2029"
+
+    def test_short_lines_sharing_words_are_kept(self):
+        assert strip_prompt_echo("the image\nTabelle 3", self.PROMPT) == "the image\nTabelle 3"
+
+    def test_echo_removed_in_recognise_crop(self, mock_model):
+        model, mock_client = mock_model
+        mock_client.post.return_value = _make_response(
+            "Preserve the original layout (headings/paragraphs/tables/formulas).\n"
+            "Do not fabricate content that does not exist in the image."
+        )
+        assert model._recognise_crop(Image.new("RGB", (400, 400))) == ""

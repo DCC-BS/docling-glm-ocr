@@ -107,6 +107,7 @@ constructor arguments always take precedence over environment variables.
 | `GLMOCR_REMOTE_OCR_PROMPT` | Text prompt sent with each image crop | see below |
 | `GLMOCR_REMOTE_OCR_TIMEOUT` | HTTP timeout per crop (seconds) | `120` |
 | `GLMOCR_REMOTE_OCR_MAX_TOKENS` | Max tokens per completion | `16384` |
+| `GLMOCR_REMOTE_OCR_MAX_TOKENS_PER_MEGAPIXEL` | Per-crop token budget per megapixel of the crop image (min 256, max `MAX_TOKENS`, `0` disables) | `2500` |
 | `GLMOCR_REMOTE_OCR_SCALE` | Image crop rendering scale | `3.0` |
 | `GLMOCR_REMOTE_OCR_MAX_IMAGE_PIXELS` | Pixel budget per crop | `4500000` |
 | `GLMOCR_REMOTE_OCR_MAX_CONCURRENT_REQUESTS` | Max concurrent API requests | `10` |
@@ -126,6 +127,7 @@ All options can also be set programmatically via `GlmOcrRemoteOptions`:
 | `prompt` | `str` | Text prompt for each image crop | `GLMOCR_REMOTE_OCR_PROMPT` env or default prompt |
 | `timeout` | `float` | HTTP timeout per crop (seconds) | `GLMOCR_REMOTE_OCR_TIMEOUT` env or `120` |
 | `max_tokens` | `int` | Max tokens per completion | `GLMOCR_REMOTE_OCR_MAX_TOKENS` env or `16384` |
+| `max_tokens_per_megapixel` | `int` | Per-crop token budget per megapixel (min 256, max `max_tokens`, `0` disables) | `GLMOCR_REMOTE_OCR_MAX_TOKENS_PER_MEGAPIXEL` env or `2500` |
 | `scale` | `float` | Image crop rendering scale | `GLMOCR_REMOTE_OCR_SCALE` env or `3.0` |
 | `max_image_pixels` | `int` | Pixel budget per crop | `GLMOCR_REMOTE_OCR_MAX_IMAGE_PIXELS` env or `4500000` |
 | `max_concurrent_requests` | `int` | Max concurrent API requests | `GLMOCR_REMOTE_OCR_MAX_CONCURRENT_REQUESTS` env or `10` |

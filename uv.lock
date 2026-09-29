@@ -537,7 +537,7 @@ chunking = [
 
 [[package]]
 name = "docling-glm-ocr"
-version = "0.5.1"
+version = "0.5.2"
 source = { editable = "." }
 dependencies = [
     { name = "docling" },

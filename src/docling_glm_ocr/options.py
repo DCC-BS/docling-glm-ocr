@@ -39,6 +39,10 @@ class GlmOcrRemoteOptions(OcrOptions):
             Falls back to the ``GLMOCR_REMOTE_OCR_TIMEOUT`` env var.
         max_tokens: Maximum tokens for the chat completion response.
             Falls back to the ``GLMOCR_REMOTE_OCR_MAX_TOKENS`` env var.
+        max_tokens_per_megapixel: Per-crop token budget per megapixel of the crop
+            image (at least 256, at most ``max_tokens``); ``0`` disables it. Bounds
+            runaway repetition on small crops. Falls back to the
+            ``GLMOCR_REMOTE_OCR_MAX_TOKENS_PER_MEGAPIXEL`` env var.
         scale: Render scale applied to each crop before encoding.  Higher
             values improve recognition of small text at the cost of larger
             payloads.  Falls back to the ``GLMOCR_REMOTE_OCR_SCALE`` env var.
@@ -74,6 +78,9 @@ class GlmOcrRemoteOptions(OcrOptions):
     prompt: str = Field(default_factory=lambda: os.environ.get("GLMOCR_REMOTE_OCR_PROMPT", _DEFAULT_PROMPT))
     timeout: float = Field(default_factory=lambda: float(os.environ.get("GLMOCR_REMOTE_OCR_TIMEOUT", "120")))
     max_tokens: int = Field(default_factory=lambda: int(os.environ.get("GLMOCR_REMOTE_OCR_MAX_TOKENS", "16384")))
+    max_tokens_per_megapixel: int = Field(
+        default_factory=lambda: int(os.environ.get("GLMOCR_REMOTE_OCR_MAX_TOKENS_PER_MEGAPIXEL", "2500"))
+    )
     scale: float = Field(default_factory=lambda: float(os.environ.get("GLMOCR_REMOTE_OCR_SCALE", "3.0")))
     max_image_pixels: int = Field(
         default_factory=lambda: int(os.environ.get("GLMOCR_REMOTE_OCR_MAX_IMAGE_PIXELS", "4500000"))
