@@ -152,5 +152,8 @@ exclude_lines = [
 ]
 
 [tool.uv]
-exclude-newer = "1 week"
-exclude-newer-package = { dcc-backend-common = "P1D" }
+# Supply-chain cooldown: only resolve releases older than 7 days.
+exclude-newer = "P7D"
+# TEMPORARY until 2026-10-29: security releases of certifi younger than 7 days. The weekly
+# dependency routine removes these entries once the locked versions are 7 days old.
+exclude-newer-package = { dcc-backend-common = "P1D", certifi = "P0D" }
