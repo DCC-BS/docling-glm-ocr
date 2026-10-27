@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import io
 from unittest.mock import MagicMock, patch
 
@@ -10,7 +11,7 @@ import httpx
 import pytest
 from docling.datamodel.base_models import DoclingComponentType
 from docling.datamodel.pipeline_options import OcrOptions
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from docling_glm_ocr.model import (
     GlmOcrRemoteModel,
@@ -398,6 +399,12 @@ class TestModelInit:
         model, mock_client = mock_model
         assert model._get_client() is mock_client
 
+    def test_client_shared_across_threads(self, mock_model):
+        model, _ = mock_model
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            clients = list(pool.map(lambda _: model._get_client(), range(8)))
+        assert len({id(c) for c in clients}) == 1
+
     def test_scale_is_set(self, mock_model):
         model, _ = mock_model
         assert model.options.scale == pytest.approx(3.0)
@@ -441,6 +448,29 @@ class TestCall:
         assert cells[0].text == "Hello World"
         assert cells[0].from_ocr is True
         assert cells[0].confidence == 1.0
+
+    def test_one_cell_per_text_line_on_its_ink(self, mock_model):
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        image = Image.new("RGB", (100, 100), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 10, 80, 20), fill="black")
+        draw.rectangle((10, 60, 50, 70), fill="black")
+        page._backend.get_page_image.return_value = image
+
+        mock_client.post.return_value = _make_ok_response("Titel\nText")
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[self._make_ocr_rect()]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            list(model(MagicMock(), [page]))
+
+        cells = mock_post.call_args[0][0]
+        assert [c.text for c in cells] == ["Titel", "Text"]
+        assert [round(c.rect.to_bounding_box().t, 1) for c in cells] == [5.0, 30.0]
 
     def test_cell_index_matches_enumerate_position(self, mock_model):
         model, mock_client = mock_model
@@ -794,15 +824,32 @@ class TestCleanOcrText:
     def test_stray_fence_lines_removed(self):
         assert clean_ocr_text("Intro\n```markdown\n\nBody") == "Intro\n\n\nBody"
 
-    def test_html_table_becomes_one_line_per_row(self):
+    def test_html_table_becomes_one_line_per_row_with_tab_separated_cells(self):
         text = (
             '<table border="1"><tr><th align="left">Tel</th><td>061 267 87 27</td></tr>'
             "<tr><td>E-Mail</td><td>stata@bs.ch &amp; info</td></tr></table>"
         )
-        assert clean_ocr_text(text) == "Tel 061 267 87 27\nE-Mail stata@bs.ch & info"
+        assert clean_ocr_text(text) == "Tel\t061 267 87 27\nE-Mail\tstata@bs.ch & info"
 
     def test_text_around_table_kept(self):
-        assert clean_ocr_text("Kontakt\n<table><tr><td>A</td><td>B</td></tr></table>\nEnde") == "Kontakt\nA B\nEnde"
+        assert clean_ocr_text("Kontakt\n<table><tr><td>A</td><td>B</td></tr></table>\nEnde") == "Kontakt\nA\tB\nEnde"
+
+    def test_markdown_table_becomes_tab_separated_rows(self):
+        text = "Kopf\n| Datum | Betrag |\n|:---|---:|\n| 08.01. | 142.30 |\n| | |"
+        assert clean_ocr_text(text) == "Kopf\nDatum\tBetrag\n08.01.\t142.30"
+
+    def test_markdown_heading_and_bold_markers_removed(self):
+        assert clean_ocr_text("# Leistungsabrechnung\n**Total** CHF 5 * 3") == "Leistungsabrechnung\nTotal CHF 5 * 3"
+
+    def test_html_document_wrapper_removed(self):
+        text = (
+            "<!DOCTYPE html>\n<html>\n<head>\n    <title>Laden AM BACH</title>\n</head>\n<body>\n"
+            "    LADEN AM BACH\nTOTAL CHF 22.35\n</body>\n</html>"
+        )
+        assert clean_ocr_text(text) == "LADEN AM BACH\nTOTAL CHF 22.35"
+
+    def test_angle_brackets_in_text_kept(self):
+        assert clean_ocr_text("Wert <5 mg und a<b>c") == "Wert <5 mg und a<b>c"
 
     def test_plain_text_unchanged(self):
         assert clean_ocr_text("  Basel, 14. Februar 2025\nBetreff  ") == "Basel, 14. Februar 2025\nBetreff"
@@ -834,7 +881,7 @@ class TestRepetitionLoop:
     def test_clean_output_returned(self, mock_model):
         model, mock_client = mock_model
         mock_client.post.return_value = _make_response("```markdown\n<table><tr><td>A</td><td>B</td></tr></table>\n```")
-        assert model._recognise_crop(Image.new("RGB", (400, 400))) == "A B"
+        assert model._recognise_crop(Image.new("RGB", (400, 400))) == "A\tB"
 
 
 class TestPromptEcho:

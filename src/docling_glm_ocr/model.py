@@ -26,6 +26,7 @@ from docling_core.types.doc import BoundingBox, CoordOrigin
 from docling_core.types.doc.page import BoundingRectangle, TextCell
 from PIL import Image
 
+from docling_glm_ocr.lines import split_into_lines
 from docling_glm_ocr.options import GlmOcrRemoteOptions
 
 if TYPE_CHECKING:
@@ -55,6 +56,17 @@ _HTML_TABLE = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
 _HTML_ROW = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
 _HTML_CELL = re.compile(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", re.DOTALL | re.IGNORECASE)
 _HTML_TAG = re.compile(r"<[^>]+>")
+_MARKDOWN_HEADING = re.compile(r"^[ \t]*#{1,6}[ \t]+", re.MULTILINE)
+_MARKDOWN_BOLD = re.compile(r"\*\*(\S(?:.*?\S)?)\*\*")
+_DROP_LINE: Final = "\x00"
+_MARKDOWN_ROW = re.compile(r"^[ \t]*\|(.*)\|[ \t]*$", re.MULTILINE)
+# A whole HTML document instead of text: its head (title, styles) is dropped, its tags removed
+_HTML_DOCUMENT = re.compile(r"<!doctype\s+html|<html\b|<body\b", re.IGNORECASE)
+_HTML_HEAD = re.compile(r"<head\b.*?</head>", re.DOTALL | re.IGNORECASE)
+_HTML_BLOCK_TAG = re.compile(
+    r"<!doctype[^>]*>|</?(?:html|head|body|div|span|p|br|title|meta|section|article|main|header|footer)\b[^>]*>",
+    re.IGNORECASE,
+)
 # Output lines at least this long that match a prompt line count as an echo of the prompt.
 _MIN_ECHO_CHARS: Final = 15
 _REPEATED_TAIL = re.compile(rf"(.{{2,40}}?)(?:\s*\1){{{_LOOP_MIN_REPEATS - 1},}}\s*$", re.DOTALL)
@@ -71,23 +83,40 @@ def _html_table_to_text(match: re.Match[str]) -> str:
     rows = []
     for row in _HTML_ROW.findall(match.group(0)):
         cells = (" ".join(html.unescape(_HTML_TAG.sub(" ", cell)).split()) for cell in _HTML_CELL.findall(row))
-        line = " ".join(cell for cell in cells if cell)
+        # Tabs keep the cell boundaries, so the row can be split at the image's column gaps
+        line = "\t".join(cell for cell in cells if cell)
         if line:
             rows.append(line)
     return "\n".join(rows)
 
 
+def _markdown_row_to_text(match: re.Match[str]) -> str:
+    cells = [cell.strip() for cell in match.group(1).split("|")]
+    if all(set(cell) <= set(":- ") for cell in cells):
+        return _DROP_LINE  # the separator row, or a row without content
+    return "\t".join(cell for cell in cells if cell)
+
+
 def clean_ocr_text(text: str) -> str:
     """Turn GLM-OCR's markdown-ish answer into plain text for a docling text cell.
 
-    GLM-OCR sometimes wraps its answer in a code fence and writes tables as HTML. Docling
-    expects plain text in OCR cells (it builds the document structure itself), so fences
-    are removed and each table row becomes one line with its cells separated by spaces.
+    GLM-OCR sometimes wraps its answer in a code fence or a whole HTML document and writes
+    tables as HTML or markdown. Docling expects plain text in OCR cells (it builds the document
+    structure itself), so fences and document markup are removed and each table row
+    becomes one line with its cells separated by tabs.
     """
     fenced = _WRAPPING_FENCE.match(text)
     text = fenced.group(1) if fenced else _STRAY_FENCE_LINE.sub("", text)
     if "<t" in text.lower():
         text = _HTML_TABLE.sub(_html_table_to_text, text)
+    if "|" in text:
+        text = _MARKDOWN_ROW.sub(_markdown_row_to_text, text)
+        text = "\n".join(line for line in text.split("\n") if line != _DROP_LINE)
+    # Docling decides what is a heading; markdown emphasis would end up in the text
+    text = _MARKDOWN_BOLD.sub(r"\1", _MARKDOWN_HEADING.sub("", text))
+    if _HTML_DOCUMENT.search(text):
+        text = html.unescape(_HTML_BLOCK_TAG.sub("", _HTML_HEAD.sub("", text)))
+        text = "\n".join(line.strip() for line in text.splitlines())
     return text.strip()
 
 
@@ -143,9 +172,9 @@ class GlmOcrRemoteModel(BaseOcrModel):
     ) -> None:
         """Initialise the OCR engine.
 
-        The httpx client is created lazily per thread on first use, so the
-        model is safe to call from concurrent worker threads.  No client is
-        created when ``enabled`` is ``False``.
+        One httpx client is created lazily on first use and shared by all worker
+        threads (httpx clients are thread-safe), so connections are reused across
+        crops and pages.  No client is created when ``enabled`` is ``False``.
         """
         super().__init__(
             enabled=enabled,
@@ -154,7 +183,8 @@ class GlmOcrRemoteModel(BaseOcrModel):
             accelerator_options=accelerator_options,
         )
         self.options: GlmOcrRemoteOptions
-        self._local = threading.local()
+        self._client: httpx.Client | None = None
+        self._client_lock = threading.Lock()
 
         if self.enabled:
             logger.info(
@@ -203,10 +233,9 @@ class GlmOcrRemoteModel(BaseOcrModel):
         return max(_MIN_CROP_MAX_TOKENS, min(self.options.max_tokens, budget))
 
     def _get_client(self) -> httpx.Client:
-        """Return the thread-local httpx client, creating it on first use per thread.
+        """Return the shared httpx client, creating it on first use.
 
-        Each worker thread gets its own ``httpx.Client`` so concurrent requests
-        from the ``ThreadPoolExecutor`` never share connection state.
+        Its pool holds ``max_concurrent_requests`` connections, one per worker thread.
 
         Raises:
             RuntimeError: If the model is not enabled.
@@ -214,7 +243,9 @@ class GlmOcrRemoteModel(BaseOcrModel):
         if not self.enabled:
             msg = "GlmOcrRemoteModel is not enabled"
             raise RuntimeError(msg)
-        if not hasattr(self._local, "client"):
+        with self._client_lock:
+            if self._client is not None:
+                return self._client
             limits = httpx.Limits(
                 max_connections=self.options.max_concurrent_requests,
                 max_keepalive_connections=self.options.max_concurrent_requests,
@@ -222,8 +253,8 @@ class GlmOcrRemoteModel(BaseOcrModel):
             headers = {}
             if self.options.api_key:
                 headers["Authorization"] = f"Bearer {self.options.api_key}"
-            self._local.client = httpx.Client(timeout=self.options.timeout, limits=limits, headers=headers)
-        return self._local.client
+            self._client = httpx.Client(timeout=self.options.timeout, limits=limits, headers=headers)
+            return self._client
 
     def _recognise_crop(self, image: Image.Image) -> str:
         """Send a single cropped image to the remote GLM-OCR endpoint.
@@ -397,6 +428,26 @@ class GlmOcrRemoteModel(BaseOcrModel):
             ),
         ), None
 
+    @staticmethod
+    def _line_cells(cell: TextCell, image: Image.Image | None) -> list[TextCell]:
+        """Split a crop's cell into one cell per text line, each boxed tightly on its ink.
+
+        Keeps the crop's index on every line so the lines stay in crop order.
+        """
+        if image is None:
+            return [cell]
+        return [
+            TextCell(
+                index=cell.index,
+                text=text,
+                orig=text,
+                from_ocr=True,
+                confidence=cell.confidence,
+                rect=BoundingRectangle.from_bounding_box(box),
+            )
+            for text, box in split_into_lines(cell.text, image, cell.rect.to_bounding_box())
+        ]
+
     def _collect_crops(
         self,
         page: Page,
@@ -466,15 +517,15 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=self.options.max_concurrent_requests
                 ) as executor:
-                    futures = [
-                        executor.submit(self._process_crop, cell_idx, ocr_rect, image)
+                    futures = {
+                        executor.submit(self._process_crop, cell_idx, ocr_rect, image): image
                         for cell_idx, ocr_rect, image in crop_data
-                    ]
+                    }
 
                     for future in concurrent.futures.as_completed(futures):
                         cell, error_msg = future.result()
                         if cell is not None:
-                            all_ocr_cells.append(cell)
+                            all_ocr_cells.extend(self._line_cells(cell, futures[future]))
                         if error_msg is not None:
                             conv_res.errors.append(
                                 ErrorItem(
@@ -484,7 +535,7 @@ class GlmOcrRemoteModel(BaseOcrModel):
                                 )
                             )
 
-                # Sort by index to maintain deterministic sequential order
+                # Sort by crop index (stable within a crop) to keep a deterministic order
                 all_ocr_cells.sort(key=lambda c: c.index)
 
                 self.post_process_cells(all_ocr_cells, page, conv_res)

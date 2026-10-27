@@ -543,6 +543,7 @@ source = { editable = "." }
 dependencies = [
     { name = "docling" },
     { name = "httpx" },
+    { name = "numpy" },
     { name = "pillow" },
 ]
 
@@ -559,6 +560,7 @@ dev = [
 requires-dist = [
     { name = "docling", specifier = ">=2.73" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "numpy", specifier = ">=1.26" },
     { name = "pillow", specifier = ">=10.0" },
 ]
 
