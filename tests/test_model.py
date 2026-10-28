@@ -5,12 +5,14 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import io
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 from docling.datamodel.base_models import DoclingComponentType
 from docling.datamodel.pipeline_options import OcrOptions
+from docling_core.types.doc import BoundingBox, DocItemLabel
 from PIL import Image, ImageDraw
 
 from docling_glm_ocr.model import (
@@ -471,6 +473,33 @@ class TestCall:
         cells = mock_post.call_args[0][0]
         assert [c.text for c in cells] == ["Titel", "Text"]
         assert [round(c.rect.to_bounding_box().t, 1) for c in cells] == [5.0, 30.0]
+
+    def test_text_in_a_picture_keeps_the_whole_region(self, mock_model):
+        # Text read from a photo or a drawing: tight line boxes would lie inside the picture
+        # region, where docling takes the text for part of the picture and drops it
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        image = Image.new("RGB", (100, 100), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 10, 80, 20), fill="black")
+        draw.rectangle((10, 60, 50, 70), fill="black")
+        page._backend.get_page_image.return_value = image
+        picture = SimpleNamespace(label=DocItemLabel.PICTURE, bbox=BoundingBox(l=2, t=2, r=48, b=48))
+        page.predictions.layout.clusters = [picture]
+
+        mock_client.post.return_value = _make_ok_response("Titel\nText")
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[self._make_ocr_rect()]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            list(model(MagicMock(), [page]))
+
+        cells = mock_post.call_args[0][0]
+        assert [c.text for c in cells] == ["Titel\nText"]
+        assert cells[0].rect.to_bounding_box().as_tuple() == (0, 0, 50, 50)
 
     def test_cell_index_matches_enumerate_position(self, mock_model):
         model, mock_client = mock_model

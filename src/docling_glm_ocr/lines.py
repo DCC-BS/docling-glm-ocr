@@ -22,12 +22,15 @@ if TYPE_CHECKING:
 _MIN_CONTRAST: Final = 40
 # A pixel row counts as ink when it holds at least this many ink pixels (ignores specks).
 _MIN_ROW_INK: Final = 2
-# Relative to the tallest band: a band this small is an accent or a speck ...
+# Relative to the line height: a band this small is an accent or a speck ...
 _SMALL_BAND: Final = 0.25
 # ... and joins a neighbouring band at most this far away; otherwise it is dropped.
 _ATTACH_GAP: Final = 0.3
-# Relative to the tallest line: a gap at least this wide separates two columns (a space is ~0.25).
+# Relative to the line height: a gap at least this wide separates two columns (a space is ~0.25).
 _MIN_COLUMN_GAP: Final = 0.8
+# A line without tabs is split into columns only from this many on: a label and its value
+# ("Name: Helen Schmitz") have one wide gap too, but they are one cell.
+_MIN_UNTABBED_COLUMNS: Final = 3
 # Table rules: runs of ink at least this long (pixels, and share of the crop's side) ...
 _MIN_RULE_PX: Final = 48
 _MIN_RULE_SHARE: Final = 0.25
@@ -81,10 +84,30 @@ def _ink_mask(image: Image.Image) -> np.ndarray | None:
     if grey.size == 0:
         return None
     diff = np.abs(grey - int(np.median(grey)))
-    peak = int(diff.max())
-    if peak < _MIN_CONTRAST:
+    if int(diff.max()) < _MIN_CONTRAST:
         return None
-    return _without_rules(diff > max(_MIN_CONTRAST // 2, peak // 2))
+    return _without_rules(diff > max(_MIN_CONTRAST // 2, _otsu(diff)))
+
+
+def _otsu(diff: np.ndarray) -> int:
+    """The contrast that best separates background from ink (Otsu's method).
+
+    Half the strongest contrast would do for plain text, but a dark graphic next to grey
+    text (a bar chart under a scanned table) would put the text below that level.
+    """
+    hist = np.bincount(diff.ravel(), minlength=256)[:256].astype(np.float64)
+    levels = np.arange(256, dtype=np.float64)
+    weight = np.cumsum(hist)
+    mass = np.cumsum(hist * levels)
+    total, total_mass = weight[-1], mass[-1]
+    background = weight[:-1]
+    ink = total - background
+    valid = (background > 0) & (ink > 0)
+    between = np.zeros(255)
+    mean_bg = mass[:-1][valid] / background[valid]
+    mean_ink = (total_mass - mass[:-1][valid]) / ink[valid]
+    between[valid] = background[valid] * ink[valid] * (mean_bg - mean_ink) ** 2
+    return int(np.argmax(between))
 
 
 def _deskew(mask: np.ndarray) -> tuple[np.ndarray, float, int]:
@@ -131,18 +154,23 @@ def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(edges[::2].tolist(), edges[1::2].tolist(), strict=True))
 
 
+def _line_height(heights: list[int]) -> float:
+    """A typical text line's height: the tallest band would be a drawing or a chart next to the text."""
+    return float(np.percentile(heights, 75))
+
+
 def _bands(mask: np.ndarray) -> list[Band]:
     rows = _runs(mask.sum(axis=1) >= _MIN_ROW_INK)
     if not rows:
         return []
-    tallest = max(b - t for t, b in rows)
-    lines = {i: [t, b] for i, (t, b) in enumerate(rows) if b - t >= _SMALL_BAND * tallest}
+    height = _line_height([b - t for t, b in rows])
+    lines = {i: [t, b] for i, (t, b) in enumerate(rows) if b - t >= _SMALL_BAND * height}
     for i, (t, b) in enumerate(rows):
         if i in lines:
             continue
         # An accent or a speck: it joins the nearest line if close enough, otherwise it is dropped
         gap, j = min((t - rows[j][1] if j < i else rows[j][0] - b, j) for j in lines)
-        if gap <= _ATTACH_GAP * tallest:
+        if gap <= _ATTACH_GAP * height:
             lines[j] = [min(lines[j][0], t), max(lines[j][1], b)]
     kept = [lines[i] for i in sorted(lines)]
     bands: list[Band] = []
@@ -204,7 +232,7 @@ def _spread_words(text: str, bands: list[Band]) -> list[tuple[str, Band]]:
     return [(" ".join(bucket), band) for bucket, band in zip(buckets, bands, strict=True)]
 
 
-def _columns(band: Band, mask: np.ndarray, line_height: int) -> list[Band]:
+def _columns(band: Band, mask: np.ndarray, line_height: float) -> list[Band]:
     """The band's columns: ink separated by gaps much wider than a space."""
     left, t, right, b = band
     columns: list[list[int]] = []
@@ -227,21 +255,33 @@ def _split_columns(line: str, band: Band, boxes: list[Band]) -> list[tuple[str, 
         return [(plain, band)]
     parts = [p.strip() for p in line.split("\t") if p.strip()]
     if len(parts) > 1:
-        if len(parts) > len(boxes):
-            # Cells closer than a column gap share a column
-            cell_groups = _group([float(len(p) + 1) for p in parts], [float(box[2] - box[0]) for box in boxes])
-            if cell_groups is None:
-                return [(plain, band)]
-            return [(" ".join(parts[s:e]), box) for (s, e), box in zip(cell_groups, boxes, strict=True)]
-        # Keep the widest gaps, one fewer than there are cells
-        gaps = sorted(range(len(boxes) - 1), key=lambda i: boxes[i + 1][0] - boxes[i][2], reverse=True)
-        cuts = sorted(gaps[: len(parts) - 1])
-        groups = list(zip([0, *(i + 1 for i in cuts)], [*(i + 1 for i in cuts), len(boxes)], strict=True))
-        return [(part, _union(boxes[s:e])) for part, (s, e) in zip(parts, groups, strict=True)]
+        return _split_cells(parts, boxes) or [(plain, band)]
+    return _split_words(plain, boxes) or [(plain, band)]
+
+
+def _split_cells(parts: list[str], boxes: list[Band]) -> list[tuple[str, Band]] | None:
+    """Tab-separated cells on the band's columns, or None if they cannot be matched."""
+    if len(parts) > len(boxes):
+        # Cells closer than a column gap share a column
+        cell_groups = _group([float(len(p) + 1) for p in parts], [float(box[2] - box[0]) for box in boxes])
+        if cell_groups is None:
+            return None
+        return [(" ".join(parts[s:e]), box) for (s, e), box in zip(cell_groups, boxes, strict=True)]
+    # Keep the widest gaps, one fewer than there are cells
+    gaps = sorted(range(len(boxes) - 1), key=lambda i: boxes[i + 1][0] - boxes[i][2], reverse=True)
+    cuts = sorted(gaps[: len(parts) - 1])
+    groups = list(zip([0, *(i + 1 for i in cuts)], [*(i + 1 for i in cuts), len(boxes)], strict=True))
+    return [(part, _union(boxes[s:e])) for part, (s, e) in zip(parts, groups, strict=True)]
+
+
+def _split_words(plain: str, boxes: list[Band]) -> list[tuple[str, Band]] | None:
+    """The words of an untabbed line spread over the band's columns, or None to keep the line whole."""
+    if len(boxes) < _MIN_UNTABBED_COLUMNS:
+        return None
     words = plain.split()
     word_groups = _group([float(len(w) + 1) for w in words], [float(box[2] - box[0]) for box in boxes])
     if word_groups is None:
-        return [(plain, band)]
+        return None
     return [(" ".join(words[s:e]), box) for (s, e), box in zip(word_groups, boxes, strict=True)]
 
 
@@ -264,6 +304,7 @@ def _align(lines: list[str], bands: list[Band], columns: list[int]) -> list[tupl
         return None
     chars = [len(" ".join(line.split())) for line in lines]
     cells = [len([p for p in line.split("\t") if p.strip()]) for line in lines]
+    words = [len(line.split()) for line in lines]
     widths = [b[2] - b[0] for b in bands]
     # Medians: robust to the bands without text
     density = float(np.median(chars)) / max(1.0, float(np.median(widths)))
@@ -275,7 +316,8 @@ def _align(lines: list[str], bands: list[Band], columns: list[int]) -> list[tupl
         for j in range(1, m + 1):
             for i in range(j, n + 1):
                 cost[j, i], back[j, i] = cost[j, i - 1] + _SKIP_BAND_COST, 0
-                for k in range(1, min(_MAX_WRAP, i - j + 1) + 1):
+                # A line wraps over at most as many bands as it has words
+                for k in range(1, min(_MAX_WRAP, words[j - 1], i - j + 1) + 1):
                     width = sum(widths[i - k : i])
                     c = cost[j - 1, i - k] + (k - 1) * _WRAP_COST
                     if k > 1 and cells[j - 1] > 1:
@@ -296,19 +338,21 @@ def _align(lines: list[str], bands: list[Band], columns: list[int]) -> list[tupl
     return path
 
 
-def _place(lines: list[str], bands: list[Band], mask: np.ndarray) -> list[tuple[str, Band]]:
-    """Pieces of text with the band (or column) each was read from."""
-    flat = [" ".join(line.replace("\t", " ").split()) for line in lines]
-    tallest = max(b[3] - b[1] for b in bands)
-    columns = [_columns(band, mask, tallest) for band in bands]
+def _place(lines: list[str], bands: list[Band], mask: np.ndarray) -> list[tuple[str, Band]] | None:
+    """Pieces of text with the band (or column) each was read from, or None if they do not match.
+
+    Fewer bands than lines means the ink does not show the lines the model read: a frame or a
+    drawing joins them, or the text is too faint. Placing the lines anyway would put text on
+    the wrong ink, so the caller keeps the whole region instead.
+    """
     if len(lines) > len(bands):
-        groups = _group([float(len(s)) for s in flat], [float(b[2] - b[0]) for b in bands])
-        if groups is None:
-            return [("\n".join(flat), _union(bands))]
-        return [(" ".join(flat[s:e]), band) for (s, e), band in zip(groups, bands, strict=True)]
+        return None
+    flat = [" ".join(line.replace("\t", " ").split()) for line in lines]
+    height = _line_height([b[3] - b[1] for b in bands])
+    columns = [_columns(band, mask, height) for band in bands]
     path = _align(lines, bands, [len(c) for c in columns])
     if path is None:
-        return [("\n".join(flat), _union(bands))]
+        return None
     pieces: list[tuple[str, Band]] = []
     for j, s, e in path:
         if e - s == 1:
@@ -323,23 +367,27 @@ def split_into_lines(text: str, image: Image.Image, rect: BoundingBox) -> list[t
 
     ``image`` is the crop of the page region ``rect`` (top-left origin). Lines in ``text``
     may hold table cells separated by tabs. When lines and image cannot be matched, the
-    whole text gets one box: the ink's bounding box, or ``rect`` for a blank image.
+    whole text keeps ``rect``, as without line splitting.
     """
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return []
+    whole = [("\n".join(" ".join(line.replace("\t", " ").split()) for line in lines), rect)]
     mask = _ink_mask(image)
     bands: list[Band] = []
     if mask is not None:
         mask, slope, offset = _deskew(mask)
         bands = _bands(mask)
     if mask is None or not bands:
-        return [("\n".join(" ".join(line.replace("\t", " ").split()) for line in lines), rect)]
+        return whole
+    pieces = _place(lines, bands, mask)
+    if pieces is None:
+        return whole
 
     sx = (rect.r - rect.l) / image.width
     sy = (rect.b - rect.t) / image.height
     placed = []
-    for piece, box in _place(lines, bands, mask):
+    for piece, box in pieces:
         left, t, right, b = _unshear(box, slope, offset, image.height)
         placed.append((
             piece,

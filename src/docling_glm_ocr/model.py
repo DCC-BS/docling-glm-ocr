@@ -22,7 +22,7 @@ import httpx
 from docling.datamodel.base_models import DoclingComponentType, ErrorItem
 from docling.models.base_ocr_model import BaseOcrModel
 from docling.utils.profiling import TimeRecorder
-from docling_core.types.doc import BoundingBox, CoordOrigin
+from docling_core.types.doc import BoundingBox, CoordOrigin, DocItemLabel
 from docling_core.types.doc.page import BoundingRectangle, TextCell
 from PIL import Image
 
@@ -69,6 +69,8 @@ _HTML_BLOCK_TAG = re.compile(
 )
 # Output lines at least this long that match a prompt line count as an echo of the prompt.
 _MIN_ECHO_CHARS: Final = 15
+# A crop counts as part of a picture when a picture region covers at least this share of it
+_PICTURE_SHARE: Final = 0.5
 _REPEATED_TAIL = re.compile(rf"(.{{2,40}}?)(?:\s*\1){{{_LOOP_MIN_REPEATS - 1},}}\s*$", re.DOTALL)
 
 
@@ -429,6 +431,27 @@ class GlmOcrRemoteModel(BaseOcrModel):
         ), None
 
     @staticmethod
+    def _in_picture(page: Page, rect: BoundingBox) -> bool:
+        """Whether a picture region covers most of ``rect`` (a photo, a drawing, a logo).
+
+        Docling treats text cells inside a picture region as part of the picture and leaves
+        them out of the text. The whole crop's cell reaches past the region and stays text.
+        """
+        layout = page.predictions.layout
+        area = (rect.r - rect.l) * (rect.b - rect.t)
+        if layout is None or area <= 0:
+            return False
+        for cluster in layout.clusters:
+            if cluster.label != DocItemLabel.PICTURE:
+                continue
+            box = cluster.bbox
+            width = min(rect.r, box.r) - max(rect.l, box.l)
+            height = min(rect.b, box.b) - max(rect.t, box.t)
+            if width > 0 and height > 0 and width * height >= _PICTURE_SHARE * area:
+                return True
+        return False
+
+    @staticmethod
     def _line_cells(cell: TextCell, image: Image.Image | None) -> list[TextCell]:
         """Split a crop's cell into one cell per text line, each boxed tightly on its ink.
 
@@ -517,8 +540,11 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=self.options.max_concurrent_requests
                 ) as executor:
+                    # No line splitting in pictures: their text keeps the whole crop (see _in_picture)
                     futures = {
-                        executor.submit(self._process_crop, cell_idx, ocr_rect, image): image
+                        executor.submit(self._process_crop, cell_idx, ocr_rect, image): (
+                            None if self._in_picture(page, ocr_rect) else image
+                        )
                         for cell_idx, ocr_rect, image in crop_data
                     }
 

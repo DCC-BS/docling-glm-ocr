@@ -147,12 +147,38 @@ def test_lines_the_model_left_out_are_skipped():
     assert all(box.b <= 50 + 140 / 2 for _, box in cells)
 
 
-def test_more_lines_than_bands_joins_lines():
+def test_more_lines_than_bands_keeps_whole_region():
+    # The ink does not show the lines the model read (a frame or a drawing joins them):
+    # the text keeps the whole region, as without line splitting
     image = _page([(20, 20, 380, 40)])
 
     cells = split_into_lines("a\nb", image, RECT)
 
-    assert [text for text, _ in cells] == ["a b"]
+    assert _boxes(cells) == [("a\nb", (100.0, 50.0, 300.0, 150.0))]
+
+
+def test_grey_text_found_next_to_a_dark_graphic():
+    # A scanned table in grey ink above a black bar chart: the chart must not set the ink level
+    image = Image.new("RGB", (400, 200), "white")
+    draw = ImageDraw.Draw(image)
+    for top in (10, 40, 70):
+        draw.rectangle((20, top, 300, top + 15), fill=(140, 140, 140))
+    draw.rectangle((20, 120, 60, 190), fill="black")
+    draw.rectangle((100, 150, 140, 190), fill="black")
+
+    cells = split_into_lines("Erste\nZweite\nDritte", image, RECT)
+
+    assert [text for text, _ in cells] == ["Erste", "Zweite", "Dritte"]
+    assert [(round(b.t), round(b.b)) for _, b in cells] == [(55, 63), (70, 78), (85, 93)]
+
+
+def test_label_and_value_stay_one_cell():
+    # A form line: label and value with a wide gap are not table cells
+    image = _page([(10, 20, 120, 40), (250, 20, 390, 40)])
+
+    cells = split_into_lines("Vorname, Name: Helen Schmitz", image, RECT)
+
+    assert [text for text, _ in cells] == ["Vorname, Name: Helen Schmitz"]
 
 
 def test_no_contrast_returns_whole_region():
