@@ -202,3 +202,57 @@ def test_umlaut_dots_stay_with_their_line():
 
 def test_empty_text_gives_no_cells():
     assert split_into_lines(" \n ", _page([(20, 20, 300, 40)]), RECT) == []
+
+
+def test_lines_next_to_a_box_of_lines_each_get_their_ink():
+    # A form: a title over the whole width, field lines on the left and an address box on the
+    # right whose lines share the rows of the fields; the model reads the left column first
+    image = _page([
+        (10, 10, 380, 30),
+        (10, 60, 150, 75),
+        (10, 90, 150, 105),
+        (10, 120, 150, 135),
+        (250, 62, 380, 77),
+        (250, 92, 380, 107),
+    ])
+
+    cells = split_into_lines("Titel über alles\nA eins\nB zwei\nC drei\nLea Muster\nBasel", image, RECT)
+
+    # Within a page unit: the crop is deskewed by a fraction of a degree
+    assert [(text, pytest.approx(b.l, abs=1), pytest.approx(b.t, abs=1)) for text, b in cells] == [
+        ("Titel über alles", 105, 55),
+        ("A eins", 105, 80),
+        ("B zwei", 105, 95),
+        ("C drei", 105, 110),
+        ("Lea Muster", 225, 81),
+        ("Basel", 225, 96),
+    ]
+
+
+def test_scanner_speckle_is_not_a_line():
+    lines = [(20, 20, 300, 40), (20, 80, 200, 100)]
+    image = _page(lines)
+    for x in range(3, 400, 7):
+        for y in range(3, 200, 7):
+            if not any(left - 3 <= x <= right + 3 and top - 3 <= y <= bottom + 3 for left, top, right, bottom in lines):
+                image.putpixel((x, y), (0, 0, 0))
+
+    cells = split_into_lines("Erste Zeile\nZweite", image, RECT)
+
+    assert _boxes(cells) == [
+        ("Erste Zeile", (110.0, 60.0, 250.5, 70.5)),
+        ("Zweite", (110.0, 90.0, 200.5, 100.5)),
+    ]
+
+
+def test_dotted_line_next_to_the_text_is_left_out():
+    # A receipt's dotted cut line at the right edge: its dashes neither widen the boxes nor are lines
+    dashes = [(392, y, 393, y + 5) for y in range(0, 200, 10)]
+    image = _page([(20, 20, 300, 40), (20, 80, 200, 100), *dashes])
+
+    cells = split_into_lines("Erste Zeile\nZweite", image, RECT)
+
+    assert _boxes(cells) == [
+        ("Erste Zeile", (110.0, 60.0, 250.5, 70.5)),
+        ("Zweite", (110.0, 90.0, 200.5, 100.5)),
+    ]
