@@ -23,6 +23,7 @@ classifiers = [
 dependencies = [
     "docling>=2.73",
     "httpx>=0.27",
+    "numpy>=1.26",
     "pillow>=10.0",
 ]
 
