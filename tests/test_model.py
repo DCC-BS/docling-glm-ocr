@@ -12,7 +12,7 @@ import httpx
 import pytest
 from docling.datamodel.base_models import DoclingComponentType
 from docling.datamodel.pipeline_options import OcrOptions
-from docling_core.types.doc import BoundingBox, DocItemLabel
+from docling_core.types.doc import BoundingBox, CoordOrigin, DocItemLabel
 from PIL import Image, ImageDraw
 
 from docling_glm_ocr.model import (
@@ -500,6 +500,57 @@ class TestCall:
         cells = mock_post.call_args[0][0]
         assert [c.text for c in cells] == ["Titel\nText"]
         assert cells[0].rect.to_bounding_box().as_tuple() == (0, 0, 50, 50)
+
+    def _plan_page(self, clusters):
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        # A drawing's ink fills the page: its lines cannot be placed
+        page._backend.get_page_image.return_value = Image.new("RGB", (100, 100), "black")
+        page.predictions.layout.clusters = [
+            SimpleNamespace(label=label, bbox=BoundingBox.from_tuple(box, CoordOrigin.TOPLEFT))
+            for label, box in clusters
+        ]
+        return page
+
+    def _run(self, model, page):
+        rect = BoundingBox(l=0, t=0, r=50, b=50, coord_origin=CoordOrigin.TOPLEFT)
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[rect]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            list(model(MagicMock(), [page]))
+        return mock_post.call_args[0][0]
+
+    def test_page_that_cannot_be_split_is_read_region_by_region(self, mock_model):
+        # A scanned plan: the drawing is a picture, the title and the footer are text regions
+        # (the title labelled twice); the whole page's cell would land in the picture
+        model, mock_client = mock_model
+        page = self._plan_page([
+            (DocItemLabel.PICTURE, (2, 12, 48, 40)),
+            (DocItemLabel.SECTION_HEADER, (4, 2, 42, 10)),
+            (DocItemLabel.TEXT, (4, 2, 42, 10)),
+            (DocItemLabel.PAGE_FOOTER, (4, 42, 40, 49)),
+        ])
+        mock_client.post.side_effect = [_make_ok_response("Titel\nPlan\nFuss")] + [
+            _make_ok_response("Region") for _ in range(2)
+        ]
+
+        cells = self._run(model, page)
+
+        assert mock_client.post.call_count == 3
+        assert sorted(c.rect.to_bounding_box().as_tuple() for c in cells) == [(4, 2, 42, 10), (4, 42, 40, 49)]
+        assert [c.text for c in cells] == ["Region", "Region"]
+
+    def test_page_of_one_region_keeps_the_whole_crop(self, mock_model):
+        model, mock_client = mock_model
+        page = self._plan_page([(DocItemLabel.TEXT, (4, 2, 42, 40))])
+        mock_client.post.return_value = _make_ok_response("Titel\nText")
+
+        cells = self._run(model, page)
+
+        assert mock_client.post.call_count == 1
+        assert [c.text for c in cells] == ["Titel\nText"]
 
     def test_cell_index_matches_enumerate_position(self, mock_model):
         model, mock_client = mock_model

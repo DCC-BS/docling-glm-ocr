@@ -71,6 +71,11 @@ _HTML_BLOCK_TAG = re.compile(
 _MIN_ECHO_CHARS: Final = 15
 # A crop counts as part of a picture when a picture region covers at least this share of it
 _PICTURE_SHARE: Final = 0.5
+# A layout region lies in a crop (or in another region) when this share of its area does
+_INSIDE_SHARE: Final = 0.5
+# A crop is read region by region only from this many text regions on: with fewer, the
+# layout found little of its text (a footer on a page of notes and drawings)
+_MIN_TEXT_REGIONS: Final = 2
 _REPEATED_TAIL = re.compile(rf"(.{{2,40}}?)(?:\s*\1){{{_LOOP_MIN_REPEATS - 1},}}\s*$", re.DOTALL)
 
 
@@ -452,6 +457,30 @@ class GlmOcrRemoteModel(BaseOcrModel):
         return False
 
     @staticmethod
+    def _text_regions(page: Page, rect: BoundingBox) -> list[BoundingBox]:
+        """The text regions in a crop that holds several layout regions, each once, top to bottom.
+
+        Empty for a crop of one region: there is nothing to read region by region. Pictures
+        are left out, and a region inside a larger one (the same box labelled twice, a line
+        of a footer) is read with the larger one.
+        """
+        layout = page.predictions.layout
+        if layout is None:
+            return []
+
+        def inside(box: BoundingBox, outer: BoundingBox) -> bool:
+            return box.intersection_area_with(outer) >= _INSIDE_SHARE * box.area() > 0
+
+        clusters = [c for c in layout.clusters if inside(c.bbox, rect)]
+        if len(clusters) <= 1:
+            return []
+        regions: list[BoundingBox] = []
+        for cluster in sorted(clusters, key=lambda c: -c.bbox.area()):
+            if cluster.label != DocItemLabel.PICTURE and not any(inside(cluster.bbox, r) for r in regions):
+                regions.append(cluster.bbox.to_top_left_origin(page.size.height))
+        return sorted(regions, key=lambda r: (r.t, r.l))
+
+    @staticmethod
     def _line_cells(cell: TextCell, image: Image.Image | None) -> list[TextCell]:
         """Split a crop's cell into one cell per text line, each boxed tightly on its ink.
 
@@ -536,30 +565,23 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 all_ocr_cells: list[TextCell] = []
 
                 crop_data = self._collect_crops(page, ocr_rects)
-
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=self.options.max_concurrent_requests
-                ) as executor:
-                    # No line splitting in pictures: their text keeps the whole crop (see _in_picture)
-                    futures = {
-                        executor.submit(self._process_crop, cell_idx, ocr_rect, image): (
-                            None if self._in_picture(page, ocr_rect) else image
-                        )
-                        for cell_idx, ocr_rect, image in crop_data
-                    }
-
-                    for future in concurrent.futures.as_completed(futures):
-                        cell, error_msg = future.result()
-                        if cell is not None:
-                            all_ocr_cells.extend(self._line_cells(cell, futures[future]))
-                        if error_msg is not None:
-                            conv_res.errors.append(
-                                ErrorItem(
-                                    component_type=DoclingComponentType.MODEL,
-                                    module_name=__name__,
-                                    error_message=error_msg,
-                                )
-                            )
+                # No line splitting in pictures: their text keeps the whole crop (see _in_picture)
+                split = [None if self._in_picture(page, rect) else image for _, rect, image in crop_data]
+                regions: list[tuple[int, list[BoundingBox], list[TextCell]]] = []
+                for cell, lines in self._recognise(crop_data, split, conv_res):
+                    rect = cell.rect.to_bounding_box()
+                    # Lines that could not be placed keep the whole crop: on a page with a drawing
+                    # that cell lands in the picture and is lost, so read its text regions instead
+                    whole = len(lines) == 1 and lines[0].rect.to_bounding_box() == rect
+                    found = self._text_regions(page, rect) if whole else []
+                    if len(found) >= _MIN_TEXT_REGIONS:
+                        regions.append((cell.index, found, lines))
+                    else:
+                        all_ocr_cells.extend(lines)
+                for index, found, lines in regions:
+                    crops = [(index, rect, image) for _, rect, image in self._collect_crops(page, found)]
+                    read = [line for _, region_lines in self._recognise(crops, None, conv_res) for line in region_lines]
+                    all_ocr_cells.extend(read or lines)
 
                 # Sort by crop index (stable within a crop) to keep a deterministic order
                 all_ocr_cells.sort(key=lambda c: c.index)
@@ -567,6 +589,38 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 self.post_process_cells(all_ocr_cells, page, conv_res)
 
             yield page
+
+    def _recognise(
+        self,
+        crop_data: list[tuple[int, BoundingBox, Image.Image | None]],
+        split: list[Image.Image | None] | None,
+        conv_res: ConversionResult,
+    ) -> list[tuple[TextCell, list[TextCell]]]:
+        """OCR the crops in parallel: each crop's cell with its line cells (split on ``split``'s images).
+
+        ``split`` holds the image to split each crop's text on, or None to keep it whole; by
+        default every crop is split on its own image. Errors are recorded on ``conv_res``.
+        """
+        images = split if split is not None else [image for _, _, image in crop_data]
+        results: list[tuple[TextCell, list[TextCell]]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.options.max_concurrent_requests) as executor:
+            futures = {
+                executor.submit(self._process_crop, cell_idx, rect, image): line_image
+                for (cell_idx, rect, image), line_image in zip(crop_data, images, strict=True)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                cell, error_msg = future.result()
+                if cell is not None:
+                    results.append((cell, self._line_cells(cell, futures[future])))
+                if error_msg is not None:
+                    conv_res.errors.append(
+                        ErrorItem(
+                            component_type=DoclingComponentType.MODEL,
+                            module_name=__name__,
+                            error_message=error_msg,
+                        )
+                    )
+        return results
 
     @classmethod
     def get_options_type(cls) -> type[OcrOptions]:
