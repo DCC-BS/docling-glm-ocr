@@ -76,7 +76,9 @@ _INSIDE_SHARE: Final = 0.5
 # A crop is read region by region only from this many text regions on: with fewer, the
 # layout found little of its text (a footer on a page of notes and drawings)
 _MIN_TEXT_REGIONS: Final = 2
-_REPEATED_TAIL = re.compile(rf"(.{{2,40}}?)(?:\s*\1){{{_LOOP_MIN_REPEATS - 1},}}\s*$", re.DOTALL)
+# Runs on the tail with whitespace collapsed, and the unit starts with a non-space: otherwise
+# `\s*` and `\1` can split a run of spaces in exponentially many ways and the search never ends
+_REPEATED_TAIL = re.compile(rf"(\S.{{1,39}}?)(?: ?\1){{{_LOOP_MIN_REPEATS - 1},}} ?$", re.DOTALL)
 
 
 def _pil_to_base64_uri(image: Image.Image, fmt: str = "PNG") -> str:
@@ -163,7 +165,7 @@ def is_repetition_loop(text: str) -> bool:
         _, count = Counter(lines).most_common(1)[0]
         if count >= _LOOP_MIN_REPEATS and count / len(lines) >= _LOOP_LINE_SHARE:
             return True
-    return bool(_REPEATED_TAIL.search(text[-600:]))
+    return bool(_REPEATED_TAIL.search(" ".join(text[-600:].split())))
 
 
 class GlmOcrRemoteModel(BaseOcrModel):

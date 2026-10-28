@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import io
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -967,6 +969,31 @@ class TestRepetitionLoop:
         """A table column with a few repeated values stays below the share threshold."""
         rows = [f"Position {i} 0" for i in range(30)] + ["0"] * 5
         assert not is_repetition_loop("\n".join(rows))
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Preis " + " " * 300 + "CHF",
+            "Kurs\n" + "\n" * 300 + "Ende",
+            "| Datum |" + " " * 200 + "| Ort |" + " \t" * 100 + "x",
+        ],
+    )
+    def test_whitespace_runs_checked_quickly(self, text):
+        """Regression: a long whitespace run made the tail regex backtrack exponentially.
+
+        GLM-OCR pads layouts such as a flyer with runs of spaces; with 40 spaces the check
+        took 12 s, with a few more it never returned and, holding the GIL, stopped the
+        whole docling-serve process. A regex cannot be interrupted from inside Python, so
+        the check runs in a subprocess with a timeout.
+        """
+        code = "import sys; from docling_glm_ocr.model import is_repetition_loop as f; print(f(sys.stdin.read()))"
+        result = subprocess.run(  # noqa: S603 -- fixed command, the input is test data
+            [sys.executable, "-c", code], input=text, capture_output=True, text=True, timeout=10, check=True
+        )
+        assert result.stdout.strip() == "False"
+
+    def test_loop_after_whitespace_run_detected(self):
+        assert is_repetition_loop("Kopfzeile" + " " * 300 + "\n" + "Wiesbaden " * 20)
 
     def test_loop_output_discarded(self, mock_model):
         model, mock_client = mock_model
