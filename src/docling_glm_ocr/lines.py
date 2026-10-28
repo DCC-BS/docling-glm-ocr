@@ -84,30 +84,10 @@ def _ink_mask(image: Image.Image) -> np.ndarray | None:
     if grey.size == 0:
         return None
     diff = np.abs(grey - int(np.median(grey)))
-    if int(diff.max()) < _MIN_CONTRAST:
+    peak = int(diff.max())
+    if peak < _MIN_CONTRAST:
         return None
-    return _without_rules(diff > max(_MIN_CONTRAST // 2, _otsu(diff)))
-
-
-def _otsu(diff: np.ndarray) -> int:
-    """The contrast that best separates background from ink (Otsu's method).
-
-    Half the strongest contrast would do for plain text, but a dark graphic next to grey
-    text (a bar chart under a scanned table) would put the text below that level.
-    """
-    hist = np.bincount(diff.ravel(), minlength=256)[:256].astype(np.float64)
-    levels = np.arange(256, dtype=np.float64)
-    weight = np.cumsum(hist)
-    mass = np.cumsum(hist * levels)
-    total, total_mass = weight[-1], mass[-1]
-    background = weight[:-1]
-    ink = total - background
-    valid = (background > 0) & (ink > 0)
-    between = np.zeros(255)
-    mean_bg = mass[:-1][valid] / background[valid]
-    mean_ink = (total_mass - mass[:-1][valid]) / ink[valid]
-    between[valid] = background[valid] * ink[valid] * (mean_bg - mean_ink) ** 2
-    return int(np.argmax(between))
+    return _without_rules(diff > max(_MIN_CONTRAST // 2, peak // 2))
 
 
 def _deskew(mask: np.ndarray) -> tuple[np.ndarray, float, int]:

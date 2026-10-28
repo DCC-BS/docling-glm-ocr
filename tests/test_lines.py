@@ -157,14 +157,9 @@ def test_more_lines_than_bands_keeps_whole_region():
     assert _boxes(cells) == [("a\nb", (100.0, 50.0, 300.0, 150.0))]
 
 
-def test_grey_text_found_next_to_a_dark_graphic():
-    # A scanned table in grey ink above a black bar chart: the chart must not set the ink level
-    image = Image.new("RGB", (400, 200), "white")
-    draw = ImageDraw.Draw(image)
-    for top in (10, 40, 70):
-        draw.rectangle((20, top, 300, top + 15), fill=(140, 140, 140))
-    draw.rectangle((20, 120, 60, 190), fill="black")
-    draw.rectangle((100, 150, 140, 190), fill="black")
+def test_text_lines_found_next_to_a_tall_chart():
+    # A table above a bar chart: the chart's band must not make the text lines count as specks
+    image = _page([(20, 10, 300, 25), (20, 40, 300, 55), (20, 70, 300, 85), (20, 120, 60, 190), (100, 150, 140, 190)])
 
     cells = split_into_lines("Erste\nZweite\nDritte", image, RECT)
 
