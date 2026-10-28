@@ -501,9 +501,11 @@ class TestCall:
         assert [c.text for c in cells] == ["Titel\nText"]
         assert cells[0].rect.to_bounding_box().as_tuple() == (0, 0, 50, 50)
 
-    def _plan_page(self, clusters):
+    def _plan_page(self, clusters, *, pdf_text=True):
         page = MagicMock()
         page._backend.is_valid.return_value = True
+        # A scan with the scanner's text layer
+        page.cells = [SimpleNamespace(text="Plan", from_ocr=False)] if pdf_text else []
         # A drawing's ink fills the page: its lines cannot be placed
         page._backend.get_page_image.return_value = Image.new("RGB", (100, 100), "black")
         page.predictions.layout.clusters = [
@@ -541,6 +543,19 @@ class TestCall:
         assert mock_client.post.call_count == 3
         assert sorted(c.rect.to_bounding_box().as_tuple() for c in cells) == [(4, 2, 42, 10), (4, 42, 40, 49)]
         assert [c.text for c in cells] == ["Region", "Region"]
+
+    def test_photo_without_text_layer_keeps_the_whole_crop(self, mock_model):
+        # A form photo: the whole cell stays text and holds words the regions would miss
+        model, mock_client = mock_model
+        page = self._plan_page(
+            [(DocItemLabel.SECTION_HEADER, (4, 2, 42, 10)), (DocItemLabel.TEXT, (4, 20, 42, 40))], pdf_text=False
+        )
+        mock_client.post.return_value = _make_ok_response("Titel\nText")
+
+        cells = self._run(model, page)
+
+        assert mock_client.post.call_count == 1
+        assert [c.text for c in cells] == ["Titel\nText"]
 
     def test_page_of_one_region_keeps_the_whole_crop(self, mock_model):
         model, mock_client = mock_model

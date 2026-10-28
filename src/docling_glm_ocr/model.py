@@ -565,15 +565,18 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 all_ocr_cells: list[TextCell] = []
 
                 crop_data = self._collect_crops(page, ocr_rects)
+                pdf_text = self._has_pdf_text(page)
                 # No line splitting in pictures: their text keeps the whole crop (see _in_picture)
                 split = [None if self._in_picture(page, rect) else image for _, rect, image in crop_data]
                 regions: list[tuple[int, list[BoundingBox], list[TextCell]]] = []
                 for cell, lines in self._recognise(crop_data, split, conv_res):
                     rect = cell.rect.to_bounding_box()
-                    # Lines that could not be placed keep the whole crop: on a page with a drawing
-                    # that cell lands in the picture and is lost, so read its text regions instead
+                    # Lines that could not be placed keep the whole crop. On a page with a text layer
+                    # (a scanned plan) docling drops that cell for the PDF text it touches, and the
+                    # PDF text in the drawing with it, so read the crop's text regions instead. On a
+                    # photo or a scan without text the whole cell stays text: it holds all the words.
                     whole = len(lines) == 1 and lines[0].rect.to_bounding_box() == rect
-                    found = self._text_regions(page, rect) if whole else []
+                    found = self._text_regions(page, rect) if whole and pdf_text else []
                     if len(found) >= _MIN_TEXT_REGIONS:
                         regions.append((cell.index, found, lines))
                     else:
