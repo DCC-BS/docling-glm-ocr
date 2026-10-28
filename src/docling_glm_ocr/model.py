@@ -467,7 +467,7 @@ class GlmOcrRemoteModel(BaseOcrModel):
         of a footer) is read with the larger one.
         """
         layout = page.predictions.layout
-        if layout is None:
+        if layout is None or page.size is None:
             return []
 
         def inside(box: BoundingBox, outer: BoundingBox) -> bool:
