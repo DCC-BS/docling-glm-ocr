@@ -1,0 +1,44 @@
+[tools]
+uv = "0.11.31"
+
+[hooks]
+postinstall = { task = "install" }
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
+
+[tasks.install]
+description = "Create the virtual environment"
+alias = "i"
+sources = ["pyproject.toml", "uv.lock"]
+outputs = [".venv"]
+run = "uv sync --all-extras"
+
+# ── Quality ───────────────────────────────────────────────────────────────────
+
+[tasks.check]
+description = "Verify lockfile, lint, format, and type-check"
+alias = "c"
+run = [
+    "uv lock --locked",
+    "uv run ruff check --fix .",
+    "uv run ruff format .",
+    "uv run ty check src/",
+]
+
+[tasks.ci-check]
+description = "Same checks as `check`, failing instead of fixing"
+run = [
+    "uv lock --locked",
+    "make check",
+]
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+
+[tasks."test:unit"]
+description = "Run the unit tests"
+alias = "t"
+run = "uv run pytest --cov --cov-report=xml --junitxml=junit.xml"
+
+[tasks.ci]
+description = "Run all CI checks"
+depends = ["ci-check", "test:unit"]
