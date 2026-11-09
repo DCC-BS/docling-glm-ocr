@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import io
 import subprocess
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 from docling.datamodel.base_models import DoclingComponentType
 from docling.datamodel.pipeline_options import OcrOptions
-from PIL import Image
+from docling_core.types.doc import BoundingBox, CoordOrigin, DocItemLabel
+from PIL import Image, ImageDraw
 
 from docling_glm_ocr.model import (
     GlmOcrRemoteModel,
@@ -400,6 +403,12 @@ class TestModelInit:
         model, mock_client = mock_model
         assert model._get_client() is mock_client
 
+    def test_client_shared_across_threads(self, mock_model):
+        model, _ = mock_model
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            clients = list(pool.map(lambda _: model._get_client(), range(8)))
+        assert len({id(c) for c in clients}) == 1
+
     def test_scale_is_set(self, mock_model):
         model, _ = mock_model
         assert model.options.scale == pytest.approx(3.0)
@@ -443,6 +452,122 @@ class TestCall:
         assert cells[0].text == "Hello World"
         assert cells[0].from_ocr is True
         assert cells[0].confidence == 1.0
+
+    def test_one_cell_per_text_line_on_its_ink(self, mock_model):
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        image = Image.new("RGB", (100, 100), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 10, 80, 20), fill="black")
+        draw.rectangle((10, 60, 50, 70), fill="black")
+        page._backend.get_page_image.return_value = image
+
+        mock_client.post.return_value = _make_ok_response("Titel\nText")
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[self._make_ocr_rect()]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            list(model(MagicMock(), [page]))
+
+        cells = mock_post.call_args[0][0]
+        assert [c.text for c in cells] == ["Titel", "Text"]
+        assert [round(c.rect.to_bounding_box().t, 1) for c in cells] == [5.0, 30.0]
+
+    def test_text_in_a_picture_keeps_the_whole_region(self, mock_model):
+        # Text read from a photo or a drawing: tight line boxes would lie inside the picture
+        # region, where docling takes the text for part of the picture and drops it
+        model, mock_client = mock_model
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        image = Image.new("RGB", (100, 100), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 10, 80, 20), fill="black")
+        draw.rectangle((10, 60, 50, 70), fill="black")
+        page._backend.get_page_image.return_value = image
+        picture = SimpleNamespace(label=DocItemLabel.PICTURE, bbox=BoundingBox(l=2, t=2, r=48, b=48))
+        page.predictions.layout.clusters = [picture]
+
+        mock_client.post.return_value = _make_ok_response("Titel\nText")
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[self._make_ocr_rect()]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            list(model(MagicMock(), [page]))
+
+        cells = mock_post.call_args[0][0]
+        assert [c.text for c in cells] == ["Titel\nText"]
+        assert cells[0].rect.to_bounding_box().as_tuple() == (0, 0, 50, 50)
+
+    def _plan_page(self, clusters, *, pdf_text=True):
+        page = MagicMock()
+        page._backend.is_valid.return_value = True
+        # A scan with the scanner's text layer
+        page.cells = [SimpleNamespace(text="Plan", from_ocr=False)] if pdf_text else []
+        # A drawing's ink fills the page: its lines cannot be placed
+        page._backend.get_page_image.return_value = Image.new("RGB", (100, 100), "black")
+        page.predictions.layout.clusters = [
+            SimpleNamespace(label=label, bbox=BoundingBox.from_tuple(box, CoordOrigin.TOPLEFT))
+            for label, box in clusters
+        ]
+        return page
+
+    def _run(self, model, page):
+        rect = BoundingBox(l=0, t=0, r=50, b=50, coord_origin=CoordOrigin.TOPLEFT)
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[rect]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            list(model(MagicMock(), [page]))
+        return mock_post.call_args[0][0]
+
+    def test_page_that_cannot_be_split_is_read_region_by_region(self, mock_model):
+        # A scanned plan: the drawing is a picture, the title and the footer are text regions
+        # (the title labelled twice); the whole page's cell would land in the picture
+        model, mock_client = mock_model
+        page = self._plan_page([
+            (DocItemLabel.PICTURE, (2, 12, 48, 40)),
+            (DocItemLabel.SECTION_HEADER, (4, 2, 42, 10)),
+            (DocItemLabel.TEXT, (4, 2, 42, 10)),
+            (DocItemLabel.PAGE_FOOTER, (4, 42, 40, 49)),
+        ])
+        mock_client.post.side_effect = [_make_ok_response("Titel\nPlan\nFuss")] + [
+            _make_ok_response("Region") for _ in range(2)
+        ]
+
+        cells = self._run(model, page)
+
+        assert mock_client.post.call_count == 3
+        assert sorted(c.rect.to_bounding_box().as_tuple() for c in cells) == [(4, 2, 42, 10), (4, 42, 40, 49)]
+        assert [c.text for c in cells] == ["Region", "Region"]
+
+    def test_photo_without_text_layer_keeps_the_whole_crop(self, mock_model):
+        # A form photo: the whole cell stays text and holds words the regions would miss
+        model, mock_client = mock_model
+        page = self._plan_page(
+            [(DocItemLabel.SECTION_HEADER, (4, 2, 42, 10)), (DocItemLabel.TEXT, (4, 20, 42, 40))], pdf_text=False
+        )
+        mock_client.post.return_value = _make_ok_response("Titel\nText")
+
+        cells = self._run(model, page)
+
+        assert mock_client.post.call_count == 1
+        assert [c.text for c in cells] == ["Titel\nText"]
+
+    def test_page_of_one_region_keeps_the_whole_crop(self, mock_model):
+        model, mock_client = mock_model
+        page = self._plan_page([(DocItemLabel.TEXT, (4, 2, 42, 40))])
+        mock_client.post.return_value = _make_ok_response("Titel\nText")
+
+        cells = self._run(model, page)
+
+        assert mock_client.post.call_count == 1
+        assert [c.text for c in cells] == ["Titel\nText"]
 
     def test_cell_index_matches_enumerate_position(self, mock_model):
         model, mock_client = mock_model
@@ -796,15 +921,32 @@ class TestCleanOcrText:
     def test_stray_fence_lines_removed(self):
         assert clean_ocr_text("Intro\n```markdown\n\nBody") == "Intro\n\n\nBody"
 
-    def test_html_table_becomes_one_line_per_row(self):
+    def test_html_table_becomes_one_line_per_row_with_tab_separated_cells(self):
         text = (
             '<table border="1"><tr><th align="left">Tel</th><td>061 267 87 27</td></tr>'
             "<tr><td>E-Mail</td><td>stata@bs.ch &amp; info</td></tr></table>"
         )
-        assert clean_ocr_text(text) == "Tel 061 267 87 27\nE-Mail stata@bs.ch & info"
+        assert clean_ocr_text(text) == "Tel\t061 267 87 27\nE-Mail\tstata@bs.ch & info"
 
     def test_text_around_table_kept(self):
-        assert clean_ocr_text("Kontakt\n<table><tr><td>A</td><td>B</td></tr></table>\nEnde") == "Kontakt\nA B\nEnde"
+        assert clean_ocr_text("Kontakt\n<table><tr><td>A</td><td>B</td></tr></table>\nEnde") == "Kontakt\nA\tB\nEnde"
+
+    def test_markdown_table_becomes_tab_separated_rows(self):
+        text = "Kopf\n| Datum | Betrag |\n|:---|---:|\n| 08.01. | 142.30 |\n| | |"
+        assert clean_ocr_text(text) == "Kopf\nDatum\tBetrag\n08.01.\t142.30"
+
+    def test_markdown_heading_and_bold_markers_removed(self):
+        assert clean_ocr_text("# Leistungsabrechnung\n**Total** CHF 5 * 3") == "Leistungsabrechnung\nTotal CHF 5 * 3"
+
+    def test_html_document_wrapper_removed(self):
+        text = (
+            "<!DOCTYPE html>\n<html>\n<head>\n    <title>Laden AM BACH</title>\n</head>\n<body>\n"
+            "    LADEN AM BACH\nTOTAL CHF 22.35\n</body>\n</html>"
+        )
+        assert clean_ocr_text(text) == "LADEN AM BACH\nTOTAL CHF 22.35"
+
+    def test_angle_brackets_in_text_kept(self):
+        assert clean_ocr_text("Wert <5 mg und a<b>c") == "Wert <5 mg und a<b>c"
 
     def test_plain_text_unchanged(self):
         assert clean_ocr_text("  Basel, 14. Februar 2025\nBetreff  ") == "Basel, 14. Februar 2025\nBetreff"
@@ -861,7 +1003,7 @@ class TestRepetitionLoop:
     def test_clean_output_returned(self, mock_model):
         model, mock_client = mock_model
         mock_client.post.return_value = _make_response("```markdown\n<table><tr><td>A</td><td>B</td></tr></table>\n```")
-        assert model._recognise_crop(Image.new("RGB", (400, 400))) == "A B"
+        assert model._recognise_crop(Image.new("RGB", (400, 400))) == "A\tB"
 
 
 class TestPromptEcho:

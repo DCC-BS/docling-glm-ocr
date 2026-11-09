@@ -22,10 +22,11 @@ import httpx
 from docling.datamodel.base_models import DoclingComponentType, ErrorItem
 from docling.models.base_ocr_model import BaseOcrModel
 from docling.utils.profiling import TimeRecorder
-from docling_core.types.doc import BoundingBox, CoordOrigin
+from docling_core.types.doc import BoundingBox, CoordOrigin, DocItemLabel
 from docling_core.types.doc.page import BoundingRectangle, TextCell
 from PIL import Image
 
+from docling_glm_ocr.lines import split_into_lines
 from docling_glm_ocr.options import GlmOcrRemoteOptions
 
 if TYPE_CHECKING:
@@ -55,8 +56,26 @@ _HTML_TABLE = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
 _HTML_ROW = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
 _HTML_CELL = re.compile(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", re.DOTALL | re.IGNORECASE)
 _HTML_TAG = re.compile(r"<[^>]+>")
+_MARKDOWN_HEADING = re.compile(r"^[ \t]*#{1,6}[ \t]+", re.MULTILINE)
+_MARKDOWN_BOLD = re.compile(r"\*\*(\S(?:.*?\S)?)\*\*")
+_DROP_LINE: Final = "\x00"
+_MARKDOWN_ROW = re.compile(r"^[ \t]*\|(.*)\|[ \t]*$", re.MULTILINE)
+# A whole HTML document instead of text: its head (title, styles) is dropped, its tags removed
+_HTML_DOCUMENT = re.compile(r"<!doctype\s+html|<html\b|<body\b", re.IGNORECASE)
+_HTML_HEAD = re.compile(r"<head\b.*?</head>", re.DOTALL | re.IGNORECASE)
+_HTML_BLOCK_TAG = re.compile(
+    r"<!doctype[^>]*>|</?(?:html|head|body|div|span|p|br|title|meta|section|article|main|header|footer)\b[^>]*>",
+    re.IGNORECASE,
+)
 # Output lines at least this long that match a prompt line count as an echo of the prompt.
 _MIN_ECHO_CHARS: Final = 15
+# A crop counts as part of a picture when a picture region covers at least this share of it
+_PICTURE_SHARE: Final = 0.5
+# A layout region lies in a crop (or in another region) when this share of its area does
+_INSIDE_SHARE: Final = 0.5
+# A crop is read region by region only from this many text regions on: with fewer, the
+# layout found little of its text (a footer on a page of notes and drawings)
+_MIN_TEXT_REGIONS: Final = 2
 # Runs on the tail with whitespace collapsed, and the unit starts with a non-space: otherwise
 # `\s*` and `\1` can split a run of spaces in exponentially many ways and the search never ends
 _REPEATED_TAIL = re.compile(rf"(\S.{{1,39}}?)(?: ?\1){{{_LOOP_MIN_REPEATS - 1},}} ?$", re.DOTALL)
@@ -73,23 +92,40 @@ def _html_table_to_text(match: re.Match[str]) -> str:
     rows = []
     for row in _HTML_ROW.findall(match.group(0)):
         cells = (" ".join(html.unescape(_HTML_TAG.sub(" ", cell)).split()) for cell in _HTML_CELL.findall(row))
-        line = " ".join(cell for cell in cells if cell)
+        # Tabs keep the cell boundaries, so the row can be split at the image's column gaps
+        line = "\t".join(cell for cell in cells if cell)
         if line:
             rows.append(line)
     return "\n".join(rows)
 
 
+def _markdown_row_to_text(match: re.Match[str]) -> str:
+    cells = [cell.strip() for cell in match.group(1).split("|")]
+    if all(set(cell) <= set(":- ") for cell in cells):
+        return _DROP_LINE  # the separator row, or a row without content
+    return "\t".join(cell for cell in cells if cell)
+
+
 def clean_ocr_text(text: str) -> str:
     """Turn GLM-OCR's markdown-ish answer into plain text for a docling text cell.
 
-    GLM-OCR sometimes wraps its answer in a code fence and writes tables as HTML. Docling
-    expects plain text in OCR cells (it builds the document structure itself), so fences
-    are removed and each table row becomes one line with its cells separated by spaces.
+    GLM-OCR sometimes wraps its answer in a code fence or a whole HTML document and writes
+    tables as HTML or markdown. Docling expects plain text in OCR cells (it builds the document
+    structure itself), so fences and document markup are removed and each table row
+    becomes one line with its cells separated by tabs.
     """
     fenced = _WRAPPING_FENCE.match(text)
     text = fenced.group(1) if fenced else _STRAY_FENCE_LINE.sub("", text)
     if "<t" in text.lower():
         text = _HTML_TABLE.sub(_html_table_to_text, text)
+    if "|" in text:
+        text = _MARKDOWN_ROW.sub(_markdown_row_to_text, text)
+        text = "\n".join(line for line in text.split("\n") if line != _DROP_LINE)
+    # Docling decides what is a heading; markdown emphasis would end up in the text
+    text = _MARKDOWN_BOLD.sub(r"\1", _MARKDOWN_HEADING.sub("", text))
+    if _HTML_DOCUMENT.search(text):
+        text = html.unescape(_HTML_BLOCK_TAG.sub("", _HTML_HEAD.sub("", text)))
+        text = "\n".join(line.strip() for line in text.splitlines())
     return text.strip()
 
 
@@ -145,9 +181,9 @@ class GlmOcrRemoteModel(BaseOcrModel):
     ) -> None:
         """Initialise the OCR engine.
 
-        The httpx client is created lazily per thread on first use, so the
-        model is safe to call from concurrent worker threads.  No client is
-        created when ``enabled`` is ``False``.
+        One httpx client is created lazily on first use and shared by all worker
+        threads (httpx clients are thread-safe), so connections are reused across
+        crops and pages.  No client is created when ``enabled`` is ``False``.
         """
         super().__init__(
             enabled=enabled,
@@ -156,7 +192,8 @@ class GlmOcrRemoteModel(BaseOcrModel):
             accelerator_options=accelerator_options,
         )
         self.options: GlmOcrRemoteOptions
-        self._local = threading.local()
+        self._client: httpx.Client | None = None
+        self._client_lock = threading.Lock()
 
         if self.enabled:
             logger.info(
@@ -205,10 +242,9 @@ class GlmOcrRemoteModel(BaseOcrModel):
         return max(_MIN_CROP_MAX_TOKENS, min(self.options.max_tokens, budget))
 
     def _get_client(self) -> httpx.Client:
-        """Return the thread-local httpx client, creating it on first use per thread.
+        """Return the shared httpx client, creating it on first use.
 
-        Each worker thread gets its own ``httpx.Client`` so concurrent requests
-        from the ``ThreadPoolExecutor`` never share connection state.
+        Its pool holds ``max_concurrent_requests`` connections, one per worker thread.
 
         Raises:
             RuntimeError: If the model is not enabled.
@@ -216,7 +252,9 @@ class GlmOcrRemoteModel(BaseOcrModel):
         if not self.enabled:
             msg = "GlmOcrRemoteModel is not enabled"
             raise RuntimeError(msg)
-        if not hasattr(self._local, "client"):
+        with self._client_lock:
+            if self._client is not None:
+                return self._client
             limits = httpx.Limits(
                 max_connections=self.options.max_concurrent_requests,
                 max_keepalive_connections=self.options.max_concurrent_requests,
@@ -224,8 +262,8 @@ class GlmOcrRemoteModel(BaseOcrModel):
             headers = {}
             if self.options.api_key:
                 headers["Authorization"] = f"Bearer {self.options.api_key}"
-            self._local.client = httpx.Client(timeout=self.options.timeout, limits=limits, headers=headers)
-        return self._local.client
+            self._client = httpx.Client(timeout=self.options.timeout, limits=limits, headers=headers)
+            return self._client
 
     def _recognise_crop(self, image: Image.Image) -> str:
         """Send a single cropped image to the remote GLM-OCR endpoint.
@@ -399,6 +437,71 @@ class GlmOcrRemoteModel(BaseOcrModel):
             ),
         ), None
 
+    @staticmethod
+    def _in_picture(page: Page, rect: BoundingBox) -> bool:
+        """Whether a picture region covers most of ``rect`` (a photo, a drawing, a logo).
+
+        Docling treats text cells inside a picture region as part of the picture and leaves
+        them out of the text. The whole crop's cell reaches past the region and stays text.
+        """
+        layout = page.predictions.layout
+        area = (rect.r - rect.l) * (rect.b - rect.t)
+        if layout is None or area <= 0:
+            return False
+        for cluster in layout.clusters:
+            if cluster.label != DocItemLabel.PICTURE:
+                continue
+            box = cluster.bbox
+            width = min(rect.r, box.r) - max(rect.l, box.l)
+            height = min(rect.b, box.b) - max(rect.t, box.t)
+            if width > 0 and height > 0 and width * height >= _PICTURE_SHARE * area:
+                return True
+        return False
+
+    @staticmethod
+    def _text_regions(page: Page, rect: BoundingBox) -> list[BoundingBox]:
+        """The text regions in a crop that holds several layout regions, each once, top to bottom.
+
+        Empty for a crop of one region: there is nothing to read region by region. Pictures
+        are left out, and a region inside a larger one (the same box labelled twice, a line
+        of a footer) is read with the larger one.
+        """
+        layout = page.predictions.layout
+        if layout is None or page.size is None:
+            return []
+
+        def inside(box: BoundingBox, outer: BoundingBox) -> bool:
+            return box.intersection_area_with(outer) >= _INSIDE_SHARE * box.area() > 0
+
+        clusters = [c for c in layout.clusters if inside(c.bbox, rect)]
+        if len(clusters) <= 1:
+            return []
+        regions: list[BoundingBox] = []
+        for cluster in sorted(clusters, key=lambda c: -c.bbox.area()):
+            if cluster.label != DocItemLabel.PICTURE and not any(inside(cluster.bbox, r) for r in regions):
+                regions.append(cluster.bbox.to_top_left_origin(page.size.height))
+        return sorted(regions, key=lambda r: (r.t, r.l))
+
+    @staticmethod
+    def _line_cells(cell: TextCell, image: Image.Image | None) -> list[TextCell]:
+        """Split a crop's cell into one cell per text line, each boxed tightly on its ink.
+
+        Keeps the crop's index on every line so the lines stay in crop order.
+        """
+        if image is None:
+            return [cell]
+        return [
+            TextCell(
+                index=cell.index,
+                text=text,
+                orig=text,
+                from_ocr=True,
+                confidence=cell.confidence,
+                rect=BoundingRectangle.from_bounding_box(box),
+            )
+            for text, box in split_into_lines(cell.text, image, cell.rect.to_bounding_box())
+        ]
+
     def _collect_crops(
         self,
         page: Page,
@@ -464,34 +567,65 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 all_ocr_cells: list[TextCell] = []
 
                 crop_data = self._collect_crops(page, ocr_rects)
+                pdf_text = self._has_pdf_text(page)
+                # No line splitting in pictures: their text keeps the whole crop (see _in_picture)
+                split = [None if self._in_picture(page, rect) else image for _, rect, image in crop_data]
+                regions: list[tuple[int, list[BoundingBox], list[TextCell]]] = []
+                for cell, lines in self._recognise(crop_data, split, conv_res):
+                    rect = cell.rect.to_bounding_box()
+                    # Lines that could not be placed keep the whole crop. On a page with a text layer
+                    # (a scanned plan) docling drops that cell for the PDF text it touches, and the
+                    # PDF text in the drawing with it, so read the crop's text regions instead. On a
+                    # photo or a scan without text the whole cell stays text: it holds all the words.
+                    whole = len(lines) == 1 and lines[0].rect.to_bounding_box() == rect
+                    found = self._text_regions(page, rect) if whole and pdf_text else []
+                    if len(found) >= _MIN_TEXT_REGIONS:
+                        regions.append((cell.index, found, lines))
+                    else:
+                        all_ocr_cells.extend(lines)
+                for index, found, lines in regions:
+                    crops = [(index, rect, image) for _, rect, image in self._collect_crops(page, found)]
+                    read = [line for _, region_lines in self._recognise(crops, None, conv_res) for line in region_lines]
+                    all_ocr_cells.extend(read or lines)
 
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=self.options.max_concurrent_requests
-                ) as executor:
-                    futures = [
-                        executor.submit(self._process_crop, cell_idx, ocr_rect, image)
-                        for cell_idx, ocr_rect, image in crop_data
-                    ]
-
-                    for future in concurrent.futures.as_completed(futures):
-                        cell, error_msg = future.result()
-                        if cell is not None:
-                            all_ocr_cells.append(cell)
-                        if error_msg is not None:
-                            conv_res.errors.append(
-                                ErrorItem(
-                                    component_type=DoclingComponentType.MODEL,
-                                    module_name=__name__,
-                                    error_message=error_msg,
-                                )
-                            )
-
-                # Sort by index to maintain deterministic sequential order
+                # Sort by crop index (stable within a crop) to keep a deterministic order
                 all_ocr_cells.sort(key=lambda c: c.index)
 
                 self.post_process_cells(all_ocr_cells, page, conv_res)
 
             yield page
+
+    def _recognise(
+        self,
+        crop_data: list[tuple[int, BoundingBox, Image.Image | None]],
+        split: list[Image.Image | None] | None,
+        conv_res: ConversionResult,
+    ) -> list[tuple[TextCell, list[TextCell]]]:
+        """OCR the crops in parallel: each crop's cell with its line cells (split on ``split``'s images).
+
+        ``split`` holds the image to split each crop's text on, or None to keep it whole; by
+        default every crop is split on its own image. Errors are recorded on ``conv_res``.
+        """
+        images = split if split is not None else [image for _, _, image in crop_data]
+        results: list[tuple[TextCell, list[TextCell]]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.options.max_concurrent_requests) as executor:
+            futures = {
+                executor.submit(self._process_crop, cell_idx, rect, image): line_image
+                for (cell_idx, rect, image), line_image in zip(crop_data, images, strict=True)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                cell, error_msg = future.result()
+                if cell is not None:
+                    results.append((cell, self._line_cells(cell, futures[future])))
+                if error_msg is not None:
+                    conv_res.errors.append(
+                        ErrorItem(
+                            component_type=DoclingComponentType.MODEL,
+                            module_name=__name__,
+                            error_message=error_msg,
+                        )
+                    )
+        return results
 
     @classmethod
     def get_options_type(cls) -> type[OcrOptions]:
