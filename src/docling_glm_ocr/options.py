@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from docling.datamodel.pipeline_options import OcrOptions
 from pydantic import ConfigDict, Field
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _DEFAULT_PROMPT = (
     "Recognize the text in the image and output in Markdown format.\n"
@@ -15,6 +18,12 @@ _DEFAULT_PROMPT = (
 )
 
 _DEFAULT_API_URL = "http://localhost:8001/v1/chat/completions"
+
+
+def _optional[T](cast: Callable[[str], T], name: str, default: str) -> T | None:
+    """The env var ``name`` (or ``default``) cast with ``cast``; an empty value means not set."""
+    value = os.environ.get(name, default).strip()
+    return cast(value) if value else None
 
 
 class GlmOcrRemoteOptions(OcrOptions):
@@ -43,6 +52,15 @@ class GlmOcrRemoteOptions(OcrOptions):
             image (at least 256, at most ``max_tokens``); ``0`` disables it. Bounds
             runaway repetition on small crops. Falls back to the
             ``GLMOCR_REMOTE_OCR_MAX_TOKENS_PER_MEGAPIXEL`` env var.
+        temperature, top_p, top_k, repetition_penalty: Sampling parameters sent with each
+            request. The defaults (0.0, 0.00001, 1, 1.1) are those of the official GLM-OCR SDK
+            (``glmocr/config.yaml``), which the model card recommends; the model's own generation
+            config decodes greedily too. Without them vLLM samples at temperature 1 and the same
+            crop gives different text from run to run. ``top_k`` and ``repetition_penalty`` are
+            vLLM extensions of the OpenAI API: set them to ``None`` (or the env var to an empty
+            string) for a server that rejects unknown parameters, and they are not sent. Fall back
+            to the ``GLMOCR_REMOTE_OCR_TEMPERATURE``, ``_TOP_P``, ``_TOP_K`` and
+            ``_REPETITION_PENALTY`` env vars.
         scale: Render scale applied to each crop before encoding.  Higher
             values improve recognition of small text at the cost of larger
             payloads.  Falls back to the ``GLMOCR_REMOTE_OCR_SCALE`` env var.
@@ -51,7 +69,8 @@ class GlmOcrRemoteOptions(OcrOptions):
             vLLM encoder token count within its pre-allocated cache.
             Falls back to the ``GLMOCR_REMOTE_OCR_MAX_IMAGE_PIXELS`` env var.
         max_concurrent_requests: Number of worker threads (and thus
-            concurrent HTTP requests) used per page.
+            concurrent HTTP requests) shared by the crops of all pages in
+            docling's OCR page batch.
             Falls back to the ``GLMOCR_REMOTE_OCR_MAX_CONCURRENT_REQUESTS``
             env var.
         max_retries: How many times a 5xx or network error is retried before
@@ -80,6 +99,12 @@ class GlmOcrRemoteOptions(OcrOptions):
     max_tokens: int = Field(default_factory=lambda: int(os.environ.get("GLMOCR_REMOTE_OCR_MAX_TOKENS", "16384")))
     max_tokens_per_megapixel: int = Field(
         default_factory=lambda: int(os.environ.get("GLMOCR_REMOTE_OCR_MAX_TOKENS_PER_MEGAPIXEL", "2500"))
+    )
+    temperature: float | None = Field(default_factory=lambda: _optional(float, "GLMOCR_REMOTE_OCR_TEMPERATURE", "0.0"))
+    top_p: float | None = Field(default_factory=lambda: _optional(float, "GLMOCR_REMOTE_OCR_TOP_P", "0.00001"))
+    top_k: int | None = Field(default_factory=lambda: _optional(int, "GLMOCR_REMOTE_OCR_TOP_K", "1"))
+    repetition_penalty: float | None = Field(
+        default_factory=lambda: _optional(float, "GLMOCR_REMOTE_OCR_REPETITION_PENALTY", "1.1")
     )
     scale: float = Field(default_factory=lambda: float(os.environ.get("GLMOCR_REMOTE_OCR_SCALE", "3.0")))
     max_image_pixels: int = Field(

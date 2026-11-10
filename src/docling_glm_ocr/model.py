@@ -16,10 +16,11 @@ import re
 import threading
 import time
 from collections import Counter
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Self
 
 import httpx
 from docling.datamodel.base_models import DoclingComponentType, ErrorItem
+from docling.datamodel.settings import settings
 from docling.models.base_ocr_model import BaseOcrModel
 from docling.utils.profiling import TimeRecorder
 from docling_core.types.doc import BoundingBox, CoordOrigin, DocItemLabel
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from docling.datamodel.accelerator_options import AcceleratorOptions
-    from docling.datamodel.base_models import Page
+    from docling.datamodel.base_models import Page, Size
     from docling.datamodel.document import ConversionResult
     from docling.datamodel.pipeline_options import OcrOptions
 
@@ -43,6 +44,9 @@ logger = logging.getLogger(__name__)
 _HTTP_CLIENT_ERROR_MIN: Final = 400
 _HTTP_SERVER_ERROR_MIN: Final = 500
 
+# zlib level of the PNG crops: level 1 encodes a scan crop about 4 times faster than Pillow's
+# default (6) for about 13 % more bytes. PNG is lossless, so the server decodes the same pixels.
+_PNG_COMPRESS_LEVEL: Final = 1
 # Lower bound for the per-crop token budget, so small crops can still hold a few lines.
 _MIN_CROP_MAX_TOKENS: Final = 256
 # A crop's output counts as a repetition loop when one line makes up this share of it ...
@@ -81,11 +85,69 @@ _MIN_TEXT_REGIONS: Final = 2
 _REPEATED_TAIL = re.compile(rf"(\S.{{1,39}}?)(?: ?\1){{{_LOOP_MIN_REPEATS - 1},}} ?$", re.DOTALL)
 
 
+class _PerPageTime:
+    """docling's ``TimeRecorder`` for a page batch: one sample per page, the batch time split evenly.
+
+    docling counts OCR time per page; one sample for the whole batch would report the pages of a
+    batch as one page taking their summed time.
+    """
+
+    def __init__(self, conv_res: ConversionResult, key: str, pages: int) -> None:
+        self._recorder = TimeRecorder(conv_res, key)
+        self._conv_res, self._key, self._pages = conv_res, key, pages
+
+    def __enter__(self) -> Self:
+        self._recorder.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._recorder.__exit__(*exc)
+        item = self._conv_res.timings.get(self._key) if settings.debug.profile_pipeline_timings else None
+        if item is None or not item.times or self._pages <= 1:
+            return
+        share = item.times.pop() / self._pages
+        start = item.start_timestamps[-1]
+        item.times.extend([share] * self._pages)
+        item.start_timestamps.extend([start] * (self._pages - 1))
+        item.count += self._pages - 1
+
+
 def _pil_to_base64_uri(image: Image.Image, fmt: str = "PNG") -> str:
     buf = io.BytesIO()
-    image.save(buf, format=fmt)
+    if fmt.upper() == "PNG":
+        image.save(buf, format=fmt, compress_level=_PNG_COMPRESS_LEVEL)
+    else:
+        image.save(buf, format=fmt)
     b64 = base64.b64encode(buf.getvalue()).decode()
     return f"data:image/{fmt.lower()};base64,{b64}"
+
+
+def _renders_whole_page(backend: object) -> bool:
+    """Whether ``get_page_image(scale, cropbox)`` renders the whole page and then crops it.
+
+    docling-parse does: rendering the page once per scale and cropping every region from that
+    image gives the same pixels at a fraction of the cost. Other backends (pypdfium2, images)
+    render just the cropbox and keep one call per crop.
+    """
+    try:
+        from docling.backend.docling_parse_backend import ThreadedDoclingParsePageBackend  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - docling without the threaded docling-parse backend
+        return False
+    return isinstance(backend, ThreadedDoclingParsePageBackend)
+
+
+def _crop_like_docling_parse(image: Image.Image, rect: BoundingBox, page_size: Size) -> Image.Image:
+    """Crop ``rect`` from a whole-page render with docling-parse's own rounding."""
+    if page_size.width <= 0 or page_size.height <= 0:
+        return image
+    box = rect.to_top_left_origin(page_height=page_size.height)
+    sx, sy = image.width / page_size.width, image.height / page_size.height
+    return image.crop((
+        max(0, round(box.l * sx)),
+        max(0, round(box.t * sy)),
+        min(image.width, round(box.r * sx)),
+        min(image.height, round(box.b * sy)),
+    ))
 
 
 def _html_table_to_text(match: re.Match[str]) -> str:
@@ -285,6 +347,12 @@ class GlmOcrRemoteModel(BaseOcrModel):
                 }
             ],
         }
+        # sampling: only what is set (a strict OpenAI-compatible server rejects unknown parameters)
+        payload.update({
+            name: value
+            for name in ("temperature", "top_p", "top_k", "repetition_penalty")
+            if (value := getattr(self.options, name)) is not None
+        })
         resp = self._get_client().post(self.options.api_url, json=payload)
         if resp.status_code >= _HTTP_CLIENT_ERROR_MIN:
             logger.error(
@@ -506,6 +574,7 @@ class GlmOcrRemoteModel(BaseOcrModel):
         self,
         page: Page,
         ocr_rects: list[BoundingBox],
+        whole_pages: dict[float, Image.Image] | None = None,
     ) -> list[tuple[int, BoundingBox, Image.Image | None]]:
         """Extract crop images for all OCR regions sequentially.
 
@@ -513,10 +582,15 @@ class GlmOcrRemoteModel(BaseOcrModel):
         with the PDF backend. Scale is capped so the extracted image never
         exceeds ``max_image_pixels``, keeping the vLLM encoder token count
         within its pre-allocated cache.
+
+        docling-parse renders the whole page for every crop, so on its pages the page is rendered
+        once at ``options.scale`` and kept in ``whole_pages`` (pass the same dict for later crops
+        of the page); crops reduced below that scale render their own page, which is not kept.
         """
         backend = page._backend  # noqa: SLF001
         if backend is None:
             return []
+        cache = whole_pages if whole_pages is not None and _renders_whole_page(backend) else None
         crop_data: list[tuple[int, BoundingBox, Image.Image | None]] = []
         for cell_idx, ocr_rect in enumerate(ocr_rects):
             if ocr_rect.area() == 0:
@@ -540,10 +614,12 @@ class GlmOcrRemoteModel(BaseOcrModel):
                     self.options.scale,
                     actual_scale,
                 )
-            high_res_image = backend.get_page_image(
-                scale=actual_scale,
-                cropbox=ocr_rect,
-            )
+            if cache is None or actual_scale != self.options.scale:
+                high_res_image = backend.get_page_image(scale=actual_scale, cropbox=ocr_rect)
+            else:
+                if actual_scale not in cache:
+                    cache[actual_scale] = backend.get_page_image(scale=actual_scale)
+                high_res_image = _crop_like_docling_parse(cache[actual_scale], ocr_rect, backend.get_size())
             crop_data.append((cell_idx, ocr_rect, high_res_image))
         return crop_data
 
@@ -552,80 +628,122 @@ class GlmOcrRemoteModel(BaseOcrModel):
         conv_res: ConversionResult,
         page_batch: Iterable[Page],
     ) -> Iterable[Page]:
-        """Run OCR on each page crop and yield pages with recognised text cells."""
+        """Run OCR on the crops of all pages in the batch and yield the pages with their text cells.
+
+        The crops of every page in docling's OCR batch are sent together, so the pages do not
+        wait for each other's slowest crop.
+        """
         if not self.enabled:
             yield from page_batch
             return
 
-        for page in page_batch:
-            if page._backend is None or not page._backend.is_valid():  # noqa: SLF001
-                yield page
-                continue
+        pages = list(page_batch)
+        valid = [page for page in pages if page._backend is not None and page._backend.is_valid()]  # noqa: SLF001
+        if valid:
+            with _PerPageTime(conv_res, "ocr", len(valid)):
+                self._ocr_pages(valid, conv_res)
+        yield from pages
 
-            with TimeRecorder(conv_res, "ocr"):
-                ocr_rects = self.get_ocr_rects(page)
-                all_ocr_cells: list[TextCell] = []
+    def _ocr_pages(self, pages: list[Page], conv_res: ConversionResult) -> None:
+        """OCR the pages' crops on one pool and hand each page its cells."""
+        renders: list[dict[float, Image.Image]] = [{} for _ in pages]  # per page, shared by both passes
+        jobs: list[tuple[list[tuple[int, BoundingBox, Image.Image | None]], list[Image.Image | None] | None]] = []
+        for page, render in zip(pages, renders, strict=True):
+            crop_data = self._collect_crops(page, self.get_ocr_rects(page), render)
+            # No line splitting in pictures: their text keeps the whole crop (see _in_picture)
+            split = [None if self._in_picture(page, rect) else image for _, rect, image in crop_data]
+            jobs.append((crop_data, split))
+        recognised = self._recognise(jobs, conv_res)
+        del jobs  # the first-pass crops are not needed any more
 
-                crop_data = self._collect_crops(page, ocr_rects)
-                pdf_text = self._has_pdf_text(page)
-                # No line splitting in pictures: their text keeps the whole crop (see _in_picture)
-                split = [None if self._in_picture(page, rect) else image for _, rect, image in crop_data]
-                regions: list[tuple[int, list[BoundingBox], list[TextCell]]] = []
-                for cell, lines in self._recognise(crop_data, split, conv_res):
-                    rect = cell.rect.to_bounding_box()
-                    # Lines that could not be placed keep the whole crop. On a page with a text layer
-                    # (a scanned plan) docling drops that cell for the PDF text it touches, and the
-                    # PDF text in the drawing with it, so read the crop's text regions instead. On a
-                    # photo or a scan without text the whole cell stays text: it holds all the words.
-                    whole = len(lines) == 1 and lines[0].rect.to_bounding_box() == rect
-                    found = self._text_regions(page, rect) if whole and pdf_text else []
-                    if len(found) >= _MIN_TEXT_REGIONS:
-                        regions.append((cell.index, found, lines))
-                    else:
-                        all_ocr_cells.extend(lines)
-                for index, found, lines in regions:
-                    crops = [(index, rect, image) for _, rect, image in self._collect_crops(page, found)]
-                    read = [line for _, region_lines in self._recognise(crops, None, conv_res) for line in region_lines]
-                    all_ocr_cells.extend(read or lines)
+        page_cells: list[list[TextCell]] = []
+        # Crops whose lines could not be placed, to be read region by region: (page, lines, region crops)
+        regions: list[tuple[int, list[TextCell], list[tuple[int, BoundingBox, Image.Image | None]]]] = []
+        for k, (page, results) in enumerate(zip(pages, recognised, strict=True)):
+            pdf_text = self._has_pdf_text(page)
+            cells: list[TextCell] = []
+            for cell, lines in results:
+                rect = cell.rect.to_bounding_box()
+                # Lines that could not be placed keep the whole crop. On a page with a text layer
+                # (a scanned plan) docling drops that cell for the PDF text it touches, and the
+                # PDF text in the drawing with it, so read the crop's text regions instead. On a
+                # photo or a scan without text the whole cell stays text: it holds all the words.
+                whole = len(lines) == 1 and lines[0].rect.to_bounding_box() == rect
+                found = self._text_regions(page, rect) if whole and pdf_text else []
+                if len(found) >= _MIN_TEXT_REGIONS:
+                    crops = [(cell.index, r, image) for _, r, image in self._collect_crops(page, found, renders[k])]
+                    regions.append((k, lines, crops))
+                else:
+                    cells.extend(lines)
+            page_cells.append(cells)
+            renders[k].clear()  # every crop of this page is cut
 
-                # Sort by crop index (stable within a crop) to keep a deterministic order
-                all_ocr_cells.sort(key=lambda c: c.index)
+        if regions:
+            read = self._recognise([(crops, None) for _, _, crops in regions], conv_res)
+            for (k, lines, _), results in zip(regions, read, strict=True):
+                page_cells[k].extend([line for _, region_lines in results for line in region_lines] or lines)
 
-                self.post_process_cells(all_ocr_cells, page, conv_res)
+        for page, cells in zip(pages, page_cells, strict=True):
+            # Sort by crop index (stable within a crop) to keep a deterministic order
+            cells.sort(key=lambda c: c.index)
+            self.post_process_cells(cells, page, conv_res)
 
-            yield page
+    def _process_and_split(
+        self,
+        cell_idx: int,
+        ocr_rect: BoundingBox,
+        image: Image.Image | None,
+        line_image: Image.Image | None,
+    ) -> tuple[TextCell | None, list[TextCell], str | None]:
+        """One crop, in a worker thread: its cell, the cell's line cells (split on ``line_image``) and any error."""
+        cell, error_msg = self._process_crop(cell_idx, ocr_rect, image)
+        return cell, self._line_cells(cell, line_image) if cell is not None else [], error_msg
 
     def _recognise(
         self,
-        crop_data: list[tuple[int, BoundingBox, Image.Image | None]],
-        split: list[Image.Image | None] | None,
+        jobs: list[tuple[list[tuple[int, BoundingBox, Image.Image | None]], list[Image.Image | None] | None]],
         conv_res: ConversionResult,
-    ) -> list[tuple[TextCell, list[TextCell]]]:
-        """OCR the crops in parallel: each crop's cell with its line cells (split on ``split``'s images).
+    ) -> list[list[tuple[TextCell, list[TextCell]]]]:
+        """OCR the crops of several jobs (pages) in parallel on one pool.
 
-        ``split`` holds the image to split each crop's text on, or None to keep it whole; by
-        default every crop is split on its own image. Errors are recorded on ``conv_res``.
+        Each job is a page's crops and the image to split each crop's text on (None in that list
+        keeps the crop whole; ``None`` for the list splits every crop on its own image). Returns,
+        per job and in crop order, each crop's cell with its line cells. Errors are recorded on
+        ``conv_res``.
         """
-        images = split if split is not None else [image for _, _, image in crop_data]
-        results: list[tuple[TextCell, list[TextCell]]] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.options.max_concurrent_requests) as executor:
-            futures = {
-                executor.submit(self._process_crop, cell_idx, rect, image): line_image
-                for (cell_idx, rect, image), line_image in zip(crop_data, images, strict=True)
-            }
-            for future in concurrent.futures.as_completed(futures):
-                cell, error_msg = future.result()
-                if cell is not None:
-                    results.append((cell, self._line_cells(cell, futures[future])))
-                if error_msg is not None:
-                    conv_res.errors.append(
-                        ErrorItem(
-                            component_type=DoclingComponentType.MODEL,
-                            module_name=__name__,
-                            error_message=error_msg,
-                        )
+            futures = [
+                [
+                    executor.submit(self._process_and_split, cell_idx, rect, image, line_image)
+                    for (cell_idx, rect, image), line_image in zip(
+                        crop_data, split if split is not None else [image for _, _, image in crop_data], strict=True
                     )
-        return results
+                ]
+                for crop_data, split in jobs
+            ]
+            out: list[list[tuple[TextCell, list[TextCell]]]] = []
+            try:
+                done = [[future.result() for future in job] for job in futures]
+            except BaseException:
+                # do not wait for the queued requests of the batch before the error surfaces
+                for future in (f for job in futures for f in job):
+                    future.cancel()
+                raise
+            for job in done:
+                results = []
+                for cell, lines, error_msg in job:
+                    if cell is not None:
+                        results.append((cell, lines))
+                    if error_msg is not None:
+                        conv_res.errors.append(
+                            ErrorItem(
+                                component_type=DoclingComponentType.MODEL,
+                                module_name=__name__,
+                                error_message=error_msg,
+                            )
+                        )
+                out.append(results)
+        return out
 
     @classmethod
     def get_options_type(cls) -> type[OcrOptions]:

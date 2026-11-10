@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 from docling_core.types.doc import BoundingBox, CoordOrigin
 from PIL import Image, ImageDraw
 
-from docling_glm_ocr.lines import split_into_lines
+from docling_glm_ocr.lines import _long_runs, split_into_lines
 
 # Page rect of the crop: 200 x 100 page units, rendered at 2 px per unit
 RECT = BoundingBox(l=100, t=50, r=300, b=150, coord_origin=CoordOrigin.TOPLEFT)
@@ -256,3 +257,31 @@ def test_dotted_line_next_to_the_text_is_left_out():
         ("Erste Zeile", (110.0, 60.0, 250.5, 70.5)),
         ("Zweite", (110.0, 90.0, 200.5, 100.5)),
     ]
+
+
+def _long_runs_naive(mask: np.ndarray, length: int, axis: int) -> np.ndarray:
+    m = mask if axis == 1 else mask.T
+    out = np.zeros_like(m)
+    for y, row in enumerate(m):
+        x = 0
+        while x < len(row):
+            if row[x]:
+                end = x
+                while end < len(row) and row[end]:
+                    end += 1
+                if end - x >= length:
+                    out[y, x:end] = True
+                x = end
+            else:
+                x += 1
+    return out if axis == 1 else out.T
+
+
+def test_long_runs_match_a_plain_scan():
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        h, w = rng.integers(1, 40, 2)
+        mask = rng.random((h, w)) < rng.random()
+        for length in (1, 2, 5, 48):
+            for axis in (0, 1):
+                assert np.array_equal(_long_runs(mask, length, axis), _long_runs_naive(mask, length, axis))

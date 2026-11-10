@@ -108,9 +108,10 @@ constructor arguments always take precedence over environment variables.
 | `GLMOCR_REMOTE_OCR_TIMEOUT` | HTTP timeout per crop (seconds) | `120` |
 | `GLMOCR_REMOTE_OCR_MAX_TOKENS` | Max tokens per completion | `16384` |
 | `GLMOCR_REMOTE_OCR_MAX_TOKENS_PER_MEGAPIXEL` | Per-crop token budget per megapixel of the crop image (min 256, max `MAX_TOKENS`, `0` disables) | `2500` |
+| `GLMOCR_REMOTE_OCR_TEMPERATURE` / `_TOP_P` / `_TOP_K` / `_REPETITION_PENALTY` | Sampling, as the official GLM-OCR SDK sends it; an empty value leaves the parameter out (for servers that reject `top_k` / `repetition_penalty`) | `0.0` / `0.00001` / `1` / `1.1` |
 | `GLMOCR_REMOTE_OCR_SCALE` | Image crop rendering scale | `3.0` |
 | `GLMOCR_REMOTE_OCR_MAX_IMAGE_PIXELS` | Pixel budget per crop | `4500000` |
-| `GLMOCR_REMOTE_OCR_MAX_CONCURRENT_REQUESTS` | Max concurrent API requests | `10` |
+| `GLMOCR_REMOTE_OCR_MAX_CONCURRENT_REQUESTS` | Max concurrent API requests per OCR page batch | `10` |
 | `GLMOCR_REMOTE_OCR_MAX_RETRIES` | Max retry attempts for HTTP errors | `3` |
 | `GLMOCR_REMOTE_OCR_RETRY_BACKOFF_FACTOR` | Exponential backoff factor for retries | `2.0` |
 | `GLMOCR_REMOTE_OCR_LANG` | Comma-separated language hint(s) | `en` |
@@ -128,9 +129,10 @@ All options can also be set programmatically via `GlmOcrRemoteOptions`:
 | `timeout` | `float` | HTTP timeout per crop (seconds) | `GLMOCR_REMOTE_OCR_TIMEOUT` env or `120` |
 | `max_tokens` | `int` | Max tokens per completion | `GLMOCR_REMOTE_OCR_MAX_TOKENS` env or `16384` |
 | `max_tokens_per_megapixel` | `int` | Per-crop token budget per megapixel (min 256, max `max_tokens`, `0` disables) | `GLMOCR_REMOTE_OCR_MAX_TOKENS_PER_MEGAPIXEL` env or `2500` |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty` | `float`, `float`, `int`, `float` | Sampling (official GLM-OCR SDK values; vLLM samples at temperature 1 without them) | `GLMOCR_REMOTE_OCR_TEMPERATURE` etc. or `0.0`, `0.00001`, `1`, `1.1` |
 | `scale` | `float` | Image crop rendering scale | `GLMOCR_REMOTE_OCR_SCALE` env or `3.0` |
 | `max_image_pixels` | `int` | Pixel budget per crop | `GLMOCR_REMOTE_OCR_MAX_IMAGE_PIXELS` env or `4500000` |
-| `max_concurrent_requests` | `int` | Max concurrent API requests | `GLMOCR_REMOTE_OCR_MAX_CONCURRENT_REQUESTS` env or `10` |
+| `max_concurrent_requests` | `int` | Max concurrent API requests per OCR page batch | `GLMOCR_REMOTE_OCR_MAX_CONCURRENT_REQUESTS` env or `10` |
 | `max_retries` | `int` | Max retry attempts for HTTP errors | `GLMOCR_REMOTE_OCR_MAX_RETRIES` env or `3` |
 | `retry_backoff_factor` | `float` | Exponential backoff factor for retries | `GLMOCR_REMOTE_OCR_RETRY_BACKOFF_FACTOR` env or `2.0` |
 | `lang` | `list[str]` | Language hint (passed to docling) | `GLMOCR_REMOTE_OCR_LANG` env (comma-separated) or `["en"]` |
@@ -160,11 +162,13 @@ flowchart LR
     GLMOCR -- "Markdown text" --> GlmOcrRemoteModel
 ```
 
-For each page the model:
+For each batch of pages docling hands to the OCR stage, the model:
 1. Collects OCR regions from the docling layout analysis
-2. Renders each region using the page backend (scale configurable, default 3×)
+2. Renders each region using the page backend (scale configurable, default 3×); with the
+   docling-parse backend each page is rendered once at the OCR scale and every region is cut from that image
 3. Encodes the crop as a base64 PNG data URI
-4. POSTs concurrent chat completion requests to the vLLM endpoint (with retry logic)
+4. POSTs the chat completion requests for the crops of all pages in the batch concurrently
+   (at most `max_concurrent_requests` at a time, with retry logic)
 5. Returns the recognised text as `TextCell` objects for docling to merge
 
 ## Starting a GLM-OCR vLLM server
