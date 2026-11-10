@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 from docling.datamodel.pipeline_options import OcrOptions
 from pydantic import ConfigDict, Field
@@ -69,7 +69,7 @@ class GlmOcrRemoteOptions(OcrOptions):
             means no ``Authorization`` header is sent.
     """
 
-    kind: ClassVar[Literal["glm-ocr-remote"]] = "glm-ocr-remote"
+    kind: ClassVar[str] = "glm-ocr-remote"
 
     api_key: str | None = Field(default_factory=lambda: os.environ.get("GLMOCR_REMOTE_OCR_API_KEY") or None)
     lang: list[str] = Field(default_factory=lambda: os.environ.get("GLMOCR_REMOTE_OCR_LANG", "en").split(","))
