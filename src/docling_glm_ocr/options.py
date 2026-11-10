@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
-from typing import ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from docling.datamodel.pipeline_options import OcrOptions
 from pydantic import ConfigDict, Field
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _DEFAULT_PROMPT = (
     "Recognize the text in the image and output in Markdown format.\n"
@@ -15,6 +18,12 @@ _DEFAULT_PROMPT = (
 )
 
 _DEFAULT_API_URL = "http://localhost:8001/v1/chat/completions"
+
+
+def _optional[T](cast: Callable[[str], T], name: str, default: str) -> T | None:
+    """The env var ``name`` (or ``default``) cast with ``cast``; an empty value means not set."""
+    value = os.environ.get(name, default).strip()
+    return cast(value) if value else None
 
 
 class GlmOcrRemoteOptions(OcrOptions):
@@ -48,8 +57,10 @@ class GlmOcrRemoteOptions(OcrOptions):
             (``glmocr/config.yaml``), which the model card recommends; the model's own generation
             config decodes greedily too. Without them vLLM samples at temperature 1 and the same
             crop gives different text from run to run. ``top_k`` and ``repetition_penalty`` are
-            vLLM extensions of the OpenAI API. Fall back to the ``GLMOCR_REMOTE_OCR_TEMPERATURE``,
-            ``_TOP_P``, ``_TOP_K`` and ``_REPETITION_PENALTY`` env vars.
+            vLLM extensions of the OpenAI API: set them to ``None`` (or the env var to an empty
+            string) for a server that rejects unknown parameters, and they are not sent. Fall back
+            to the ``GLMOCR_REMOTE_OCR_TEMPERATURE``, ``_TOP_P``, ``_TOP_K`` and
+            ``_REPETITION_PENALTY`` env vars.
         scale: Render scale applied to each crop before encoding.  Higher
             values improve recognition of small text at the cost of larger
             payloads.  Falls back to the ``GLMOCR_REMOTE_OCR_SCALE`` env var.
@@ -89,11 +100,11 @@ class GlmOcrRemoteOptions(OcrOptions):
     max_tokens_per_megapixel: int = Field(
         default_factory=lambda: int(os.environ.get("GLMOCR_REMOTE_OCR_MAX_TOKENS_PER_MEGAPIXEL", "2500"))
     )
-    temperature: float = Field(default_factory=lambda: float(os.environ.get("GLMOCR_REMOTE_OCR_TEMPERATURE", "0.0")))
-    top_p: float = Field(default_factory=lambda: float(os.environ.get("GLMOCR_REMOTE_OCR_TOP_P", "0.00001")))
-    top_k: int = Field(default_factory=lambda: int(os.environ.get("GLMOCR_REMOTE_OCR_TOP_K", "1")))
-    repetition_penalty: float = Field(
-        default_factory=lambda: float(os.environ.get("GLMOCR_REMOTE_OCR_REPETITION_PENALTY", "1.1"))
+    temperature: float | None = Field(default_factory=lambda: _optional(float, "GLMOCR_REMOTE_OCR_TEMPERATURE", "0.0"))
+    top_p: float | None = Field(default_factory=lambda: _optional(float, "GLMOCR_REMOTE_OCR_TOP_P", "0.00001"))
+    top_k: int | None = Field(default_factory=lambda: _optional(int, "GLMOCR_REMOTE_OCR_TOP_K", "1"))
+    repetition_penalty: float | None = Field(
+        default_factory=lambda: _optional(float, "GLMOCR_REMOTE_OCR_REPETITION_PENALTY", "1.1")
     )
     scale: float = Field(default_factory=lambda: float(os.environ.get("GLMOCR_REMOTE_OCR_SCALE", "3.0")))
     max_image_pixels: int = Field(

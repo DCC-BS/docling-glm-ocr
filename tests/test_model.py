@@ -1082,9 +1082,14 @@ class TestRenderOnce:
     """docling-parse pages are rendered once per scale; the crops are the ones docling-parse would cut."""
 
     def test_only_docling_parse_backends_qualify(self):
+        from docling.backend.docling_parse_backend import ThreadedDoclingParsePageBackend
+
         assert not _renders_whole_page(MagicMock())
-        backend = type("ThreadedDoclingParsePageBackend", (), {"__module__": "docling.backend.docling_parse_backend"})
-        assert _renders_whole_page(backend())
+        # same module name is not enough; a subclass defined elsewhere qualifies
+        lookalike = type("ThreadedDoclingParsePageBackend", (), {"__module__": "docling.backend.docling_parse_backend"})
+        assert not _renders_whole_page(lookalike())
+        subclass = type("Mine", (ThreadedDoclingParsePageBackend,), {"__module__": "elsewhere"})
+        assert _renders_whole_page(object.__new__(subclass))
 
     def test_crops_equal_docling_parse_crops(self, tmp_path):
         from docling.backend.docling_parse_backend import ThreadedDoclingParseDocumentBackend
@@ -1115,22 +1120,157 @@ class TestRenderOnce:
                 assert (actual.mode, actual.size) == (expected.mode, expected.size)
                 assert actual.tobytes() == expected.tobytes()
 
-    def test_page_rendered_once_per_scale(self, mock_model):
-        model, _ = mock_model
+    @staticmethod
+    def _docling_parse_page(width: float = 100.0, height: float = 100.0):
+        from docling.backend.docling_parse_backend import ThreadedDoclingParsePageBackend
+
+        def get_page_image(scale, cropbox=None):
+            image = Image.new("RGB", (round(width * scale), round(height * scale)))
+            return (
+                image
+                if cropbox is None
+                else _crop_like_docling_parse(image, cropbox, SimpleNamespace(width=width, height=height))
+            )
+
         backend_cls = type(
-            "ThreadedDoclingParsePageBackend",
-            (),
+            "FakeDoclingParsePage",
+            (ThreadedDoclingParsePageBackend,),
             {
-                "__module__": "docling.backend.docling_parse_backend",
-                "get_page_image": MagicMock(return_value=Image.new("RGB", (300, 300))),
-                "get_size": lambda self: SimpleNamespace(width=100.0, height=100.0),
+                "get_page_image": MagicMock(side_effect=get_page_image),
+                "get_size": lambda self: SimpleNamespace(width=width, height=height),
+                "is_valid": lambda self: True,
             },
         )
         page = MagicMock()
-        page._backend = backend_cls()
+        page._backend = object.__new__(backend_cls)
+        return page, backend_cls.get_page_image
+
+    def test_page_rendered_once_at_the_ocr_scale(self, mock_model):
+        model, _ = mock_model
+        page, render = self._docling_parse_page()
         rects = [BoundingBox(l=0, t=i * 10, r=50, b=i * 10 + 10, coord_origin=CoordOrigin.TOPLEFT) for i in range(5)]
+        cache: dict = {}
 
-        crops = model._collect_crops(page, rects)
+        crops = model._collect_crops(page, rects, cache)
+        model._collect_crops(page, rects[:2], cache)  # a later pass over the same page reuses the render
 
-        backend_cls.get_page_image.assert_called_once_with(scale=model.options.scale)
+        render.assert_called_once_with(scale=model.options.scale)
         assert [image.size for _, _, image in crops] == [(150, 30)] * 5
+
+    def test_reduced_scale_crops_are_not_cached(self, mock_model):
+        model, _ = mock_model
+        model.options.max_image_pixels = 1000  # every crop below needs a reduced scale
+        page, render = self._docling_parse_page()
+        cache: dict = {}
+        rects = [BoundingBox(l=0, t=0, r=50 + i, b=50, coord_origin=CoordOrigin.TOPLEFT) for i in range(3)]
+
+        model._collect_crops(page, rects, cache)
+
+        assert cache == {}
+        assert all("cropbox" in call.kwargs for call in render.call_args_list)
+
+
+class TestBatchBookkeeping:
+    """Timings, sampling parameters, region re-reads and errors when several pages share a batch."""
+
+    @staticmethod
+    def _pages(n: int) -> list[MagicMock]:
+        pages = []
+        for _ in range(n):
+            page = MagicMock()
+            page._backend.is_valid.return_value = True
+            page._backend.get_page_image.return_value = Image.new("RGB", (100, 100))
+            pages.append(page)
+        return pages
+
+    def test_ocr_time_is_recorded_per_page(self, mock_model, monkeypatch):
+        from docling.datamodel.settings import settings
+
+        model, mock_client = mock_model
+        mock_client.post.return_value = _make_ok_response("Text")
+        monkeypatch.setattr(settings.debug, "profile_pipeline_timings", True)
+        conv_res = MagicMock()
+        conv_res.timings = {}
+        rect = BoundingBox(l=0, t=0, r=50, b=50, coord_origin=CoordOrigin.TOPLEFT)
+        with patch.object(model, "get_ocr_rects", return_value=[rect]), patch.object(model, "post_process_cells"):
+            list(model(conv_res, self._pages(4)))
+
+        item = conv_res.timings["ocr"]
+        assert item.count == 4
+        assert len(item.times) == 4
+        assert len(item.start_timestamps) == 4
+        assert len(set(item.times)) == 1
+
+    def test_unset_sampling_parameters_are_not_sent(self, mock_model, monkeypatch):
+        model, mock_client = mock_model
+        mock_client.post.return_value = _make_ok_response("Text")
+        model.options.top_k = None
+        model.options.repetition_penalty = None
+        model._recognise_crop(Image.new("RGB", (40, 20)))
+        payload = mock_client.post.call_args[1]["json"]
+        assert payload["temperature"] == 0.0
+        assert "top_k" not in payload
+        assert "repetition_penalty" not in payload
+
+        monkeypatch.setenv("GLMOCR_REMOTE_OCR_TOP_K", "")
+        monkeypatch.setenv("GLMOCR_REMOTE_OCR_TEMPERATURE", "0.5")
+        opts = GlmOcrRemoteOptions()
+        assert opts.top_k is None
+        assert opts.temperature == 0.5
+
+    def test_region_re_read_lands_on_its_own_page(self, mock_model):
+        model, mock_client = mock_model
+        pages = self._pages(3)
+        rect = BoundingBox(l=0, t=0, r=50, b=50, coord_origin=CoordOrigin.TOPLEFT)
+        regions = [
+            BoundingBox(l=0, t=0, r=50, b=20, coord_origin=CoordOrigin.TOPLEFT),
+            BoundingBox(l=0, t=30, r=50, b=50, coord_origin=CoordOrigin.TOPLEFT),
+        ]
+        mock_client.post.return_value = _make_ok_response("Text")
+
+        def text_regions(page, _rect):
+            return regions if page is pages[2] else []
+
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[rect]),
+            patch.object(model, "_has_pdf_text", return_value=True),
+            patch.object(model, "_text_regions", side_effect=text_regions),
+            patch.object(model, "_line_cells", side_effect=lambda cell, _image: [cell]),
+            patch.object(model, "post_process_cells") as post,
+        ):
+            list(model(MagicMock(), pages))
+
+        cells_of = {id(call.args[1]): call.args[0] for call in post.call_args_list}
+        assert [len(cells_of[id(page)]) for page in pages] == [1, 1, 2]  # the last page got its two regions
+        assert mock_client.post.call_count == 5
+
+    def test_errors_of_several_pages_are_recorded(self, mock_model):
+        model, mock_client = mock_model
+        mock_client.post.return_value = httpx.Response(
+            400, text="bad request", request=httpx.Request("POST", model.options.api_url)
+        )
+        conv_res = MagicMock()
+        conv_res.errors = []
+        rect = BoundingBox(l=0, t=0, r=50, b=50, coord_origin=CoordOrigin.TOPLEFT)
+        with patch.object(model, "get_ocr_rects", return_value=[rect]), patch.object(model, "post_process_cells"):
+            list(model(conv_res, self._pages(3)))
+        assert len(conv_res.errors) == 3
+
+    def test_a_failing_crop_cancels_the_queued_ones(self, mock_model):
+        model, _ = mock_model
+        model.options.max_concurrent_requests = 1
+        started = []
+
+        def process(cell_idx, *_args):
+            started.append(cell_idx)
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        rects = [BoundingBox(l=0, t=i, r=50, b=i + 10, coord_origin=CoordOrigin.TOPLEFT) for i in range(6)]
+        with (
+            patch.object(model, "get_ocr_rects", return_value=rects),
+            patch.object(model, "_process_and_split", side_effect=process),
+            pytest.raises(RuntimeError),
+        ):
+            list(model(MagicMock(), self._pages(2)))
+        assert len(started) < 12
