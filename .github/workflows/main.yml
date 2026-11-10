@@ -16,7 +16,7 @@ jobs:
   # Quality checks via the DCC-BS CI pipeline (mise run ci-check)
   # ---------------------------------------------------------------------------
   quality:
-    uses: DCC-BS/ci-workflows/.github/workflows/ci.yml@a7a5611d4ea9bc55f27ca8bc22327181d0e0cbc0 # v10.0.0
+    uses: DCC-BS/ci-workflows/.github/workflows/ci.yml@8b031be53aee5210c6b392115bd941c80e798d60 # v10.0.1
     permissions:
       contents: read
       pull-requests: write
@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup mise
-        uses: DCC-BS/ci-workflows/actions/setup-mise@a7a5611d4ea9bc55f27ca8bc22327181d0e0cbc0 # v10.0.0
+        uses: DCC-BS/ci-workflows/actions/setup-mise@8b031be53aee5210c6b392115bd941c80e798d60 # v10.0.1
 
       - name: Run tests with coverage
         run: mise run test:unit
