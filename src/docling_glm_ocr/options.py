@@ -51,7 +51,8 @@ class GlmOcrRemoteOptions(OcrOptions):
             vLLM encoder token count within its pre-allocated cache.
             Falls back to the ``GLMOCR_REMOTE_OCR_MAX_IMAGE_PIXELS`` env var.
         max_concurrent_requests: Number of worker threads (and thus
-            concurrent HTTP requests) used per page.
+            concurrent HTTP requests) shared by the crops of all pages in
+            docling's OCR page batch.
             Falls back to the ``GLMOCR_REMOTE_OCR_MAX_CONCURRENT_REQUESTS``
             env var.
         max_retries: How many times a 5xx or network error is retried before

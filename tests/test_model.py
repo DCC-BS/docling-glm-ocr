@@ -7,6 +7,7 @@ import concurrent.futures
 import io
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,7 +20,9 @@ from PIL import Image, ImageDraw
 
 from docling_glm_ocr.model import (
     GlmOcrRemoteModel,
+    _crop_like_docling_parse,
     _pil_to_base64_uri,
+    _renders_whole_page,
     clean_ocr_text,
     is_repetition_loop,
     strip_prompt_echo,
@@ -1035,3 +1038,94 @@ class TestPromptEcho:
             "Do not fabricate content that does not exist in the image."
         )
         assert model._recognise_crop(Image.new("RGB", (400, 400))) == ""
+
+
+class TestPageBatch:
+    """All pages of docling's OCR batch are read together."""
+
+    def test_crops_of_all_pages_are_in_flight_together(self, mock_model):
+        model, mock_client = mock_model
+        pages = []
+        for _ in range(3):
+            page = MagicMock()
+            page._backend.is_valid.return_value = True
+            page._backend.get_page_image.return_value = Image.new("RGB", (100, 100))
+            pages.append(page)
+        # Each page has one crop: the three requests only meet if the pages do not wait for each other
+        barrier = threading.Barrier(3, timeout=5)
+
+        def post(*_args, **_kwargs):
+            barrier.wait()
+            return _make_ok_response("Text")
+
+        mock_client.post.side_effect = post
+        rect = BoundingBox(l=0, t=0, r=50, b=50, coord_origin=CoordOrigin.TOPLEFT)
+        with (
+            patch.object(model, "get_ocr_rects", return_value=[rect]),
+            patch.object(model, "post_process_cells") as mock_post,
+            patch("docling_glm_ocr.model.TimeRecorder"),
+        ):
+            out = list(model(MagicMock(), pages))
+
+        assert out == pages
+        assert mock_post.call_count == 3
+        assert [call.args[1] for call in mock_post.call_args_list] == pages
+        assert all(call.args[0][0].text == "Text" for call in mock_post.call_args_list)
+
+
+class TestRenderOnce:
+    """docling-parse pages are rendered once per scale; the crops are the ones docling-parse would cut."""
+
+    def test_only_docling_parse_backends_qualify(self):
+        assert not _renders_whole_page(MagicMock())
+        backend = type("ThreadedDoclingParsePageBackend", (), {"__module__": "docling.backend.docling_parse_backend"})
+        assert _renders_whole_page(backend())
+
+    def test_crops_equal_docling_parse_crops(self, tmp_path):
+        from docling.backend.docling_parse_backend import ThreadedDoclingParseDocumentBackend
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.document import InputDocument
+
+        image = Image.new("RGB", (612, 792), "white")
+        draw = ImageDraw.Draw(image)
+        for y in range(40, 760, 37):
+            draw.text((50, y), f"Line {y} with some text", fill="black")
+        image.save(tmp_path / "page.pdf", resolution=72)
+        doc = InputDocument(
+            path_or_stream=tmp_path / "page.pdf", format=InputFormat.PDF, backend=ThreadedDoclingParseDocumentBackend
+        )
+        backend = next(iter(doc._backend.iter_pages()))
+        assert _renders_whole_page(backend)
+        size = backend.get_size()
+        rects = [
+            BoundingBox(l=10.3, t=20.7, r=300.2, b=400.9, coord_origin=CoordOrigin.TOPLEFT),
+            BoundingBox(l=0, t=0, r=size.width, b=size.height, coord_origin=CoordOrigin.TOPLEFT),
+            BoundingBox(l=100.5, t=700.25, r=611.9, b=791.99, coord_origin=CoordOrigin.TOPLEFT),
+        ]
+        for scale in (3.0, 2.37):
+            whole = backend.get_page_image(scale=scale)
+            for rect in rects:
+                expected = backend.get_page_image(scale=scale, cropbox=rect)
+                actual = _crop_like_docling_parse(whole, rect, size)
+                assert (actual.mode, actual.size) == (expected.mode, expected.size)
+                assert actual.tobytes() == expected.tobytes()
+
+    def test_page_rendered_once_per_scale(self, mock_model):
+        model, _ = mock_model
+        backend_cls = type(
+            "ThreadedDoclingParsePageBackend",
+            (),
+            {
+                "__module__": "docling.backend.docling_parse_backend",
+                "get_page_image": MagicMock(return_value=Image.new("RGB", (300, 300))),
+                "get_size": lambda self: SimpleNamespace(width=100.0, height=100.0),
+            },
+        )
+        page = MagicMock()
+        page._backend = backend_cls()
+        rects = [BoundingBox(l=0, t=i * 10, r=50, b=i * 10 + 10, coord_origin=CoordOrigin.TOPLEFT) for i in range(5)]
+
+        crops = model._collect_crops(page, rects)
+
+        backend_cls.get_page_image.assert_called_once_with(scale=model.options.scale)
+        assert [image.size for _, _, image in crops] == [(150, 30)] * 5

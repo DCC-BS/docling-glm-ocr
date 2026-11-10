@@ -74,15 +74,21 @@ Band = tuple[int, int, int, int]  # l, t, r, b in pixels, r and b exclusive
 def _long_runs(mask: np.ndarray, length: int, axis: int) -> np.ndarray:
     """Pixels of ``mask`` that lie on a run of at least ``length`` along ``axis``."""
     m = mask if axis == 1 else mask.T
-    n = m.shape[1]
-    out = np.zeros_like(m)
-    if length <= n:
-        sums = np.cumsum(np.pad(m, ((0, 0), (1, 0))), axis=1, dtype=np.int32)
-        starts = np.zeros(m.shape, dtype=np.int32)
-        starts[:, : n - length + 1] = (sums[:, length:] - sums[:, : n - length + 1]) == length
-        covered = np.cumsum(np.pad(starts, ((0, 0), (1, 0))), axis=1)
-        idx = np.arange(n)
-        out = (covered[:, idx + 1] - covered[:, np.maximum(idx - length + 1, 0)]) > 0
+    h, n = m.shape
+    if length > n or h == 0:
+        return np.zeros_like(mask)
+    # Every row gets a blank pixel at both ends, so in the flattened mask no run crosses a row
+    padded = np.zeros((h, n + 2), dtype=np.int8)
+    padded[:, 1:-1] = m
+    edges = np.diff(padded.ravel())
+    starts = np.flatnonzero(edges == 1) + 1
+    ends = np.flatnonzero(edges == -1) + 1
+    long = ends - starts >= length
+    # +1 where a long run starts, -1 just after it ends; runs are apart, so no position repeats
+    marks = np.zeros(padded.size, dtype=np.int8)
+    marks[starts[long]] = 1
+    marks[ends[long]] = -1
+    out = (np.cumsum(marks, dtype=np.int8) > 0).reshape(h, n + 2)[:, 1:-1]
     return out if axis == 1 else out.T
 
 
