@@ -305,6 +305,10 @@ class GlmOcrRemoteModel(BaseOcrModel):
         payload = {
             "model": self.options.model_name,
             "max_tokens": max_tokens,
+            "temperature": self.options.temperature,
+            "top_p": self.options.top_p,
+            "top_k": self.options.top_k,
+            "repetition_penalty": self.options.repetition_penalty,
             "messages": [
                 {
                     "role": "user",

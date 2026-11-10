@@ -108,6 +108,11 @@ class TestRecogniseCrop:
         assert payload["model"] == "test-model"
         # 50x50 px crop: the per-crop budget's lower bound, not the global max_tokens
         assert payload["max_tokens"] == 256
+        # the official GLM-OCR SDK's sampling: greedy, mild repetition penalty
+        assert payload["temperature"] == 0.0
+        assert payload["top_p"] == 0.00001
+        assert payload["top_k"] == 1
+        assert payload["repetition_penalty"] == 1.1
         assert len(payload["messages"]) == 1
         assert payload["messages"][0]["role"] == "user"
 

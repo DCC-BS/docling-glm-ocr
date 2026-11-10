@@ -43,6 +43,13 @@ class GlmOcrRemoteOptions(OcrOptions):
             image (at least 256, at most ``max_tokens``); ``0`` disables it. Bounds
             runaway repetition on small crops. Falls back to the
             ``GLMOCR_REMOTE_OCR_MAX_TOKENS_PER_MEGAPIXEL`` env var.
+        temperature, top_p, top_k, repetition_penalty: Sampling parameters sent with each
+            request. The defaults (0.0, 0.00001, 1, 1.1) are those of the official GLM-OCR SDK
+            (``glmocr/config.yaml``), which the model card recommends; the model's own generation
+            config decodes greedily too. Without them vLLM samples at temperature 1 and the same
+            crop gives different text from run to run. ``top_k`` and ``repetition_penalty`` are
+            vLLM extensions of the OpenAI API. Fall back to the ``GLMOCR_REMOTE_OCR_TEMPERATURE``,
+            ``_TOP_P``, ``_TOP_K`` and ``_REPETITION_PENALTY`` env vars.
         scale: Render scale applied to each crop before encoding.  Higher
             values improve recognition of small text at the cost of larger
             payloads.  Falls back to the ``GLMOCR_REMOTE_OCR_SCALE`` env var.
@@ -81,6 +88,12 @@ class GlmOcrRemoteOptions(OcrOptions):
     max_tokens: int = Field(default_factory=lambda: int(os.environ.get("GLMOCR_REMOTE_OCR_MAX_TOKENS", "16384")))
     max_tokens_per_megapixel: int = Field(
         default_factory=lambda: int(os.environ.get("GLMOCR_REMOTE_OCR_MAX_TOKENS_PER_MEGAPIXEL", "2500"))
+    )
+    temperature: float = Field(default_factory=lambda: float(os.environ.get("GLMOCR_REMOTE_OCR_TEMPERATURE", "0.0")))
+    top_p: float = Field(default_factory=lambda: float(os.environ.get("GLMOCR_REMOTE_OCR_TOP_P", "0.00001")))
+    top_k: int = Field(default_factory=lambda: int(os.environ.get("GLMOCR_REMOTE_OCR_TOP_K", "1")))
+    repetition_penalty: float = Field(
+        default_factory=lambda: float(os.environ.get("GLMOCR_REMOTE_OCR_REPETITION_PENALTY", "1.1"))
     )
     scale: float = Field(default_factory=lambda: float(os.environ.get("GLMOCR_REMOTE_OCR_SCALE", "3.0")))
     max_image_pixels: int = Field(
