@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   docs:
-    uses: DCC-BS/ci-workflows/.github/workflows/llm-doc-update-conditional.yml@e4b0133a84dbb31d57dd2389f22fce8b85cf55b7 # v10.0.4
+    uses: DCC-BS/ci-workflows/.github/workflows/llm-doc-update-conditional.yml@4594d0b9ddf95dcd54c25e599f927d5a23ae7950 # v10.0.6
     permissions:
       contents: read
       issues: write
